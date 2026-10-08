@@ -1,6 +1,9 @@
-void kmain(void) {
-    const char* str = "Hello from C kernel!";
-    char* vidptr = (char*)0xB8000;
+#include <stdint.h>
+#include <stddef.h>
+#include "hal/pmm.h"
+
+void out(char* str) {
+    char *vidptr = (char*)0xB8000;
     unsigned int i = 0;
     unsigned int j = 0;
 
@@ -19,7 +22,26 @@ void kmain(void) {
         j++;
         i += 2;
     }
+}
 
-    // Бесконечный цикл
-    for(;;);
+void kmain(void)
+{
+
+
+    for (int i = 0; i < 10; i++) {
+        void *page = pmm_alloc();
+        if (!page) {
+            out("OUT OF MEMORY!");
+        } else {
+            int adr = page;
+
+            int *arcn;
+
+            char *adrc;
+
+            for (adr) {
+
+            }
+        }
+    }
 }
