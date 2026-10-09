@@ -1,5 +1,5 @@
 OUTPUT_FORMAT("binary")
-ENTRY(kernel_start)
+ENTRY(kmain)
 
 SECTIONS
 {
