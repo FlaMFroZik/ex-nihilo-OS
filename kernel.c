@@ -60,6 +60,7 @@ static unsigned int out_dec(unsigned int row, unsigned int col, uintptr_t value)
 
 void kmain(void)
 {
+    pmm_init();
     clear_screen();
     out(0, 0, "Physical pages allocated by pmm_alloc():");
 
