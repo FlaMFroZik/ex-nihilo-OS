@@ -56,7 +56,9 @@ pmm_alloc:
     cmp ebx, 128
     je .nomem
 
-    mov al, [bitmap + ebx]
+    ; movzx, а не mov al: bt ниже проверяет бит всего eax,
+    ; а старшие 3 байта после `mov al` остались бы мусором
+    movzx eax, byte [bitmap + ebx]
     cmp al, 0xFF
     jne .found_byte
 
@@ -80,15 +82,17 @@ pmm_alloc:
     shl ecx, 3
     add ecx, edx
 
-    ; установить бит
-    mov al, 1
-    mov cl, dl
-    shl al, cl
-    or [bitmap + ebx], al
-
-    ; вернуть физический адрес = index * 4096
+    ; вернуть физический адрес = index * 4096.
+    ; Считаем его СРАЗУ: ниже понадобится cl для сдвига, а cl — это
+    ; младший байт ecx, поэтому ecx к тому моменту будет испорчен.
     mov eax, ecx
     shl eax, 12
+
+    ; установить бит: маска 1 << (index & 7)
+    mov cl, dl
+    mov edx, 1
+    shl edx, cl
+    or [bitmap + ebx], dl
 
     ; освободить лок
     push pmm_lock
@@ -127,18 +131,13 @@ pmm_free:
     add esp, 4
 
     mov ebx, [esp + 16]         ; addr
-    shr ebx, 12
+    shr ebx, 12                 ; индекс страницы
 
-    mov ecx, ebx
-    shr ecx, 3
-    mov edx, ebx
-    and edx, 7
-
-    mov al, 1
-    mov cl, dl
-    shl al, cl
-    not al
-    and [bitmap + ecx], al
+    ; Сбросить бит (btr = bit test and reset): сама инструкция находит
+    ; байт bitmap[index/8] и бит index%8. Раньше здесь было `mov cl, dl`,
+    ; из-за чего ecx становился номером БИТА вместо номера БАЙТА
+    ; и чистился совсем не тот байт.
+    btr [bitmap], ebx
 
     ; освободить лок
     push pmm_lock
