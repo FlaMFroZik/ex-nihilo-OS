@@ -70,6 +70,13 @@ static unsigned int out_dec(unsigned int row, unsigned int col, uintptr_t value)
     return col;
 }
 
+/* Выводит объём в КиБ (чтобы не печатать длинные байты) */
+static unsigned int out_kib(unsigned int row, unsigned int col, uintptr_t bytes)
+{
+    col = out_dec(row, col, bytes / 1024);
+    return out(row, col, " KiB");
+}
+
 void kmain(void)
 {
     pmm_init();
@@ -78,9 +85,43 @@ void kmain(void)
     unsigned int row = 0;
     unsigned int col;
 
-    col = out(row++, 0, "Physical pages allocated by pmm_alloc():");
+    col = out(row++, 0, "E820 memory map from BIOS (INT 15h/AX=E820h):");
     (void)col;
 
+    /* --- карта памяти, собранная загрузчиком --- */
+    uint32_t entries = pmm_e820_entries();
+    uint32_t usable  = pmm_e820_usable();
+
+    col = out(row++, 0, "Entries: ");
+    col = out_dec(row - 1, col, entries);
+    col = out(row - 1, col, ", usable: ");
+    out_dec(row - 1, col, usable);
+
+    /* Печатаем до 8 записей: на экране 80x25 */
+    for (uint32_t i = 0; i < entries && i < 8; i++) {
+        e820_entry_t e;
+        if (!pmm_e820_entry(i, &e))
+            continue;
+
+        col = out(row, 1, "base=");
+        col = out_hex(row, col, (uintptr_t)e.base);
+        col = out(row, col, " len=");
+        col = out_hex(row, col, (uintptr_t)e.length);
+        col = out(row, col, " type=");
+        col = out_dec(row, col, e.type);
+        row++;
+    }
+
+    /* --- сколько памяти видит PMM --- */
+    col = out(row++, 0, "PMM usable RAM: ");
+    col = out_kib(row - 1, col, pmm_usable_bytes());
+
+    col = out(row++, 0, "Pages total/free: ");
+    col = out_dec(row - 1, col, pmm_total_pages());
+    col = out(row - 1, col, "/");
+    out_dec(row - 1, col, pmm_free_pages());
+
+    /* --- выделяем 10 страниц --- */
     void *pages[10];
 
     for (unsigned int i = 0; i < 10; i++) {
@@ -103,7 +144,6 @@ void kmain(void)
     col = out(row++, 0, "Free pages before free(): ");
     out_dec(row - 1, col, pmm_free_pages());
 
-    /* Освобождаем первую страницу и проверяем, что счётчик вырос */
     pmm_free(pages[0]);
 
     col = out(row++, 0, "Free pages after  free(): ");
