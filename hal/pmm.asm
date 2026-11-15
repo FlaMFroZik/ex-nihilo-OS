@@ -15,11 +15,14 @@
 ;            +0 qword base, +8 qword length, +16 dword type
 ;
 ; Принцип работы:
-;   1. Из карты E820 берём только области type == 1 (доступна ОС),
-;      не выходя за предел 4 ГиБ (у нас 32-битные адреса).
-;   2. Всю остальную память считаем занятой (fail closed).
-;   3. Размер bitmap — на всю доступную память, поэтому «вся ОЗУ»
-;      ограничена лишь объёмом установленной памяти.
+;   1. Весь bitmap помечается занятым (fail closed).
+;   2. Освобождаются только области type == 1 (доступные ОС).
+;   3. Затем ЗАНОВО помечаются занятыми все области type != 1.
+;      Порядок важен: записи E820 могут пересекаться (классика —
+;      базовая память кончается на 0x9FC00, а EBDA начинается там
+;      же, и одна страница принадлежит обеим записям), поэтому
+;      «занято» должно выигрывать у «свободно».
+;   4. Резервируются ядро, стек ядра и страница 0.
 ;
 ; Сам bitmap живёт в .bss ядра (kernel_end уже зарезервирован),
 ; то есть занимать под него страницы у самого себя не нужно.
@@ -27,7 +30,6 @@
 
 %define PAGE_SHIFT      12
 %define PAGE_SIZE       4096
-%define BITS_PER_ENTRY  32                          ; размер слова bitmap
 
 ; Адреса карты и ячейки BIOS можно переопределить при сборке
 ; (-DE820_COUNT_ADDR=...): это нужно host-тестам, где 0x600 не отображён.
@@ -50,19 +52,42 @@ extern test_bios_mem_kb
 %define E820_ENTRY_SIZE 24
 %define E820_TYPE_FREE  1
 
-%define BITMAP_MAX_BYTES (1024 * 1024 / 8)          ; 1 МиБ => 4 ГиБ памяти
+; 1 бит на страницу: 128 КиБ bitmap покрывает 4 ГиБ адресного пространства.
+%define BITMAP_MAX_BYTES (1024 * 1024 / 8)          ; 128 КиБ => 4 ГиБ памяти
+%define PAGE_LIMIT_MAX   (BITMAP_MAX_BYTES * 8)     ; 1048576 страниц
 
 %define KERNEL_STACK_TOP 0x90000                    ; см. kernel.asm
+%define ALLOC_HINT_WRAPPED 0xFFFFFFFF               ; «поиск уже обернулся»
+%define STACK_BOTTOM     (KERNEL_STACK_TOP - 0x10000)
+
+; Всё, что выше 4 ГиБ, нам недоступно: адреса 32-битные.
+; LAST_ADDR — последний байт, который ещё адресуется 32-битным
+; регистром. Именно 0xFFFFFFFF, а не 0xFFFFF000: иначе последняя
+; страница диапазона (0xFFFFF000) выпадала бы из модели, и при
+; ровно 4 ГиБ ОЗУ page_limit получался на 1 меньше — pmm_usable_bytes()
+; после умножения на 4096 давал 0.
+%define LAST_ADDR        0xFFFFFFFF
+
+; Легаси-области, которые нельзя отдавать, если карты E820 нет.
+; Границы заданы в НОМЕРАХ СТРАНИЦ: страница, на которую область
+; только начинается, тоже занята целиком.
+%define EBDA_PAGE_FIRST  (0x0009FC00 / PAGE_SIZE)   ; 0x9F — EBDA (0x9FC00)
+%define EBDA_PAGE_LAST   (0x0009FFFF / PAGE_SIZE)   ; 0x9F
+%define VGA_PAGE_FIRST   (0x000A0000 / PAGE_SIZE)   ; 0xA0 — VGA (0xA0000)
+%define VGA_PAGE_LAST    (0x000BFFFF / PAGE_SIZE)   ; 0xBF
+%define ROM_PAGE_FIRST   (0x000F0000 / PAGE_SIZE)   ; 0xF0 — BIOS ROM
+%define ROM_PAGE_LAST    (0x000FFFFF / PAGE_SIZE)   ; 0xFF
 
 section .bss
     alignb 4
     bitmap          resb BITMAP_MAX_BYTES   ; 1 бит = 1 страница
     pmm_lock        resd 1
     page_limit      resd 1                  ; сколько страниц покрывает bitmap
-    free_pages      resd 1                  ; свободных страниц (для pmm_free_pages)
-    e820_highest    resd 1                  ; максимальный адрес доступной памяти
+    free_pages      resd 1                  ; свободных страниц
+    have_e820       resd 1                  ; 1 — модель построена по карте BIOS
+    alloc_hint      resd 1                  ; с какой страницы начинать поиск
     e820_entries    resd 1                  ; сколько записей реально прочитано
-    e820_usable     resd 1                  ; сколько из них type == 1
+    e820_usable     resd 1                  ; сколько из них дали память
 
 section .text
 extern spin_lock
@@ -72,7 +97,7 @@ extern kernel_end
 ; ---------------------------------------------------------
 ; pmm_set_bit / pmm_clear_bit / pmm_test_bit
 ;   eax = номер страницы
-;   Меняют только память bitmap, границы уже проверены вызывающим.
+;   Границы проверяет вызывающий.
 ; ---------------------------------------------------------
 pmm_set_bit:
     bts [bitmap], eax
@@ -87,6 +112,146 @@ pmm_test_bit:
     ret
 
 ; ---------------------------------------------------------
+; pmm_entry_bounds
+;   вход:  edi -> запись E820
+;   выход: eax = начало области (байты), edx = конец (не включая),
+;          CF = 1, если запись пригодна для 32-битной модели;
+;          CF = 0, если запись начинается за пределами 4 ГиБ.
+;   Области, выходящие за 4 ГиБ, обрезаются по LAST_ADDR.
+; ---------------------------------------------------------
+pmm_entry_bounds:
+    cmp dword [edi + 4], 0          ; старшее слово base
+    jne .beyond
+    mov eax, [edi]                  ; base
+    mov edx, eax
+    cmp dword [edi + 12], 0         ; старшее слово length
+    jne .clamp
+    add edx, [edi + 8]              ; end = base + length
+    jnc .done
+.clamp:
+    mov edx, LAST_ADDR
+    jmp .done
+.beyond:
+    xor eax, eax
+    xor edx, edx
+    clc
+    ret
+.done:
+    cmp edx, LAST_ADDR
+    jbe .ok
+    mov edx, LAST_ADDR
+.ok:
+    stc
+    ret
+
+; ---------------------------------------------------------
+; pmm_count_entries — сколько записей E820 читаем (не больше E820_MAX)
+;   выход: esi
+; ---------------------------------------------------------
+pmm_count_entries:
+    mov esi, [E820_COUNT_ADDR]
+    cmp esi, E820_MAX
+    jbe .ok
+    mov esi, E820_MAX
+.ok:
+    ret
+
+; ---------------------------------------------------------
+; pmm_clear_usable_entries — освободить все области type == 1
+;   Заодно растягивает page_limit.
+; ---------------------------------------------------------
+pmm_clear_usable_entries:
+    pushad
+
+    call pmm_count_entries
+    mov edi, E820_BUF_ADDR
+
+.loop:
+    test esi, esi
+    jz .done
+    dec esi
+
+    cmp dword [edi + 16], E820_TYPE_FREE
+    jne .next
+
+    call pmm_entry_bounds
+    jnc .next
+    cmp edx, eax
+    jbe .next                       ; пустая область
+
+    ; сколько страниц до конца области
+    mov ecx, edx
+    dec ecx
+    shr ecx, PAGE_SHIFT
+    inc ecx
+    cmp ecx, PAGE_LIMIT_MAX
+    jbe .limit_ok
+    mov ecx, PAGE_LIMIT_MAX
+.limit_ok:
+    cmp ecx, [page_limit]
+    jbe .limit_kept
+    mov [page_limit], ecx
+.limit_kept:
+
+    inc dword [e820_usable]
+
+    shr eax, PAGE_SHIFT             ; первая страница области
+.free_loop:
+    btr [bitmap], eax
+    inc eax
+    cmp eax, ecx
+    jb .free_loop
+
+.next:
+    add edi, E820_ENTRY_SIZE
+    jmp .loop
+.done:
+    popad
+    ret
+
+; ---------------------------------------------------------
+; pmm_reserve_unusable_entries — пометить занятыми области type != 1
+;
+; Выполняется ПОСЛЕ pmm_clear_usable_entries: если записи пересекаются,
+; «занято» должно победить. Иначе страница EBDA (0x9F000), попавшая
+; сразу в «базовую память» и в «EBDA», осталась бы свободной.
+; ---------------------------------------------------------
+pmm_reserve_unusable_entries:
+    pushad
+
+    call pmm_count_entries
+    mov edi, E820_BUF_ADDR
+
+.loop:
+    test esi, esi
+    jz .done
+    dec esi
+
+    cmp dword [edi + 16], E820_TYPE_FREE
+    je .next                        ; это свободная область
+
+    call pmm_entry_bounds
+    jnc .next
+    cmp edx, eax
+    jbe .next
+
+    ; отметить страницы [base/4096, (end-1)/4096]
+    push edx
+    mov ebx, edx
+    dec ebx
+    shr ebx, PAGE_SHIFT
+    shr eax, PAGE_SHIFT
+    call pmm_mark_range
+    pop edx
+
+.next:
+    add edi, E820_ENTRY_SIZE
+    jmp .loop
+.done:
+    popad
+    ret
+
+; ---------------------------------------------------------
 ; pmm_mark_range
 ;   вход: eax = первая страница, ebx = последняя (включительно)
 ;   Без лока: вызывается только из pmm_init.
@@ -95,17 +260,15 @@ pmm_mark_range:
     push eax
     push ebx
 
-    ; диапазон целиком за пределом модели памяти — нечего делать
-    ; (важно: page_limit может быть 0, тогда cmp ниже дал бы underflow)
     cmp eax, ebx
     ja .done
     cmp eax, [page_limit]
-    jae .done
+    jae .done                       ; диапазон целиком за пределом модели
 
     cmp ebx, [page_limit]
     jb .clamped
     mov ebx, [page_limit]
-    dec ebx                                     ; не выходим за bitmap
+    dec ebx                         ; не выходим за bitmap
 .clamped:
     cmp eax, ebx
     ja .done
@@ -151,16 +314,14 @@ pmm_clear_range:
 
 ; ---------------------------------------------------------
 ; pmm_count_free — пересчитать free_pages по bitmap (без лока)
-;
-; Идём страница за страницей: медленнее, чем считать биты в слове,
-; зато граница page_limit обрабатывается без масок и сдвигов.
 ; ---------------------------------------------------------
 pmm_count_free:
     push eax
     push ecx
+    push edx
 
-    xor ecx, ecx                    ; номер страницы
-    xor eax, eax                    ; счётчик свободных
+    xor ecx, ecx
+    xor eax, eax
     mov edx, [page_limit]
 
 .loop:
@@ -182,8 +343,144 @@ pmm_count_free:
 
 .done:
     mov [free_pages], eax
+    pop edx
     pop ecx
     pop eax
+    ret
+
+; ---------------------------------------------------------
+; pmm_is_usable_page
+;   вход:  eax = номер страницы
+;   выход: CF = 1, если страницу можно отдавать/освобождать:
+;          она целиком лежит в области type == 1 и НЕ пересекается
+;          ни с одной областью type != 1.
+;
+;   Без этой проверки pmm_free() мог «освободить» видеопамять,
+;   BIOS ROM или MMIO-дыру: они тоже помечены битом «занято»,
+;   как и страницы, выданные аллокатором.
+; ---------------------------------------------------------
+pmm_is_usable_page:
+    pushad
+
+    mov ebx, eax
+    shl ebx, PAGE_SHIFT             ; начало страницы
+    lea ecx, [ebx + PAGE_SIZE]      ; конец страницы (не включая)
+
+    ; ---- 1. страница должна целиком лежать в области type == 1 ----
+    call pmm_count_entries
+    mov edi, E820_BUF_ADDR
+    xor ebp, ebp                    ; 1 = нашли покрывающую область
+.find_free:
+    test esi, esi
+    jz .find_done
+    dec esi
+
+    cmp dword [edi + 16], E820_TYPE_FREE
+    jne .find_next
+
+    ; pmm_entry_bounds возвращает начало в eax и КОНЕЦ в edx —
+    ; edx нельзя использовать под флаг, иначе теряется конец области
+    call pmm_entry_bounds
+    jnc .find_next
+
+    cmp ebx, eax                    ; начало страницы >= начала области?
+    jb .find_next
+    cmp ecx, edx                    ; конец страницы <= конца области?
+    ja .find_next
+
+    mov ebp, 1
+    jmp .find_done
+.find_next:
+    add edi, E820_ENTRY_SIZE
+    jmp .find_free
+.find_done:
+    test ebp, ebp
+    jz .deny
+
+    ; ---- 2. страница не должна пересекаться с областями type != 1 ----
+    call pmm_count_entries
+    mov edi, E820_BUF_ADDR
+.check_reserved:
+    test esi, esi
+    jz .allow
+    dec esi
+
+    cmp dword [edi + 16], E820_TYPE_FREE
+    je .check_next
+
+    call pmm_entry_bounds
+    jnc .check_next
+
+    ; пересечение: start < page_end И end > page_start
+    cmp edx, ebx
+    jbe .check_next
+    cmp eax, ecx
+    jae .check_next
+    jmp .deny
+.check_next:
+    add edi, E820_ENTRY_SIZE
+    jmp .check_reserved
+
+.allow:
+    stc
+    jmp .done
+.deny:
+    clc
+.done:
+    popad
+    ret
+
+; ---------------------------------------------------------
+; pmm_is_legacy_reserved
+;   вход:  eax = номер страницы
+;   выход: CF = 1, если страница попадает в EBDA / VGA / BIOS ROM.
+;   Используется только когда карты E820 нет.
+;
+; Страница считается занятой, если она ПЕРЕСЕКАЕТСЯ с областью:
+; EBDA начинается на 0x9FC00, то есть внутри страницы 0x9F, поэтому
+; сравнивать надо с началом и концом страницы, а не самой области.
+; ---------------------------------------------------------
+pmm_is_legacy_reserved:
+    pushad
+
+    mov eax, [esp + 32]             ; номер страницы (pushad = 32 байта)
+    mov ebx, eax
+    shl ebx, PAGE_SHIFT             ; начало страницы
+    lea ecx, [ebx + PAGE_SIZE]      ; конец страницы (не включая)
+
+    ; --- EBDA: 0x9FC00 .. 0xA0000 ---
+    mov eax, 0x0009FC00
+    mov edx, 0x000A0000
+    call .overlaps
+
+    ; --- видеопамять: 0xA0000 .. 0xC0000 ---
+    mov eax, 0x000A0000
+    mov edx, 0x000C0000
+    call .overlaps
+
+    ; --- BIOS ROM: 0xF0000 .. 0x100000 ---
+    mov eax, 0x000F0000
+    mov edx, 0x00100000
+    call .overlaps
+
+    clc
+    jmp .done
+
+; eax = начало области, edx = конец области, ebx/ecx = страница.
+; CF = 1, если [ebx, ecx) пересекается с [eax, edx).
+.overlaps:
+    cmp edx, ebx                    ; область кончается до страницы?
+    jbe .no
+    cmp eax, ecx                    ; область начинается после страницы?
+    jae .no
+    stc
+    ret
+.no:
+    clc
+    ret
+
+.done:
+    popad
     ret
 
 ; ---------------------------------------------------------
@@ -193,14 +490,14 @@ pmm_count_free:
 ; ---------------------------------------------------------
 global pmm_init
 pmm_init:
-    push eax
-    push ebx
-    push ecx
-    push edx
-    push esi
-    push edi
+    pushad
 
     mov dword [pmm_lock], 0
+    mov dword [page_limit], 0
+    mov dword [free_pages], 0
+    mov dword [e820_usable], 0
+    mov dword [have_e820], 0
+    mov dword [alloc_hint], 0
 
     ; ---- 1. Всё занято: пока карта не разобрана, память не выдаём ----
     mov edi, bitmap
@@ -209,95 +506,14 @@ pmm_init:
     rep stosd
 
     ; ---- 2. Разобрать карту E820 ----
-    mov esi, [E820_COUNT_ADDR]
+    call pmm_count_entries
     mov [e820_entries], esi
-    mov dword [e820_usable], 0
-    mov dword [e820_highest], 0
-    mov dword [page_limit], 0
-
     test esi, esi
     jz .no_e820                     ; загрузчик не смог опросить BIOS
-    cmp esi, E820_MAX
-    jbe .count_ok
-    mov esi, E820_MAX
-    mov [e820_entries], esi
-.count_ok:
-    mov edi, E820_BUF_ADDR
 
-.entry_loop:
-    test esi, esi
-    jz .entries_done
-
-    ; длина области: старшее слово должно быть нулевым (иначе > 4 ГиБ)
-    cmp dword [edi + 12], 0
-    jne .next_entry
-    mov ebx, [edi + 8]              ; младшее слово длины
-    test ebx, ebx
-    jz .next_entry                  ; пустая область
-
-    ; база: старшее слово должно быть нулевым
-    mov eax, [edi + 4]
-    test eax, eax
-    jnz .next_entry
-
-    ; область должна быть доступна ОС
-    cmp dword [edi + 16], E820_TYPE_FREE
-    jne .next_entry
-
-    ; считать адрес конца области (с защитой от переполнения)
-    mov eax, [edi]                  ; base (младшее слово)
-    mov edx, eax
-    add edx, ebx                    ; end = base + length
-    jc .clamp_4g
-    jmp .end_ready
-.clamp_4g:
-    mov edx, 0xFFFFF000             ; 4 ГиБ минус страница
-.end_ready:
-
-    ; запомнить самый высокий доступный адрес
-    cmp edx, [e820_highest]
-    jbe .no_highest
-    mov [e820_highest], edx
-.no_highest:
-
-    cmp edx, eax
-    jbe .next_entry                 ; пустой диапазон — запись ничего не даёт
-
-    ; запись реально принесла память — учитываем её в статистике
-    inc dword [e820_usable]
-
-    ; ---- освободить страницы [base/4096, (end-1)/4096] ----
-    ; Здесь нужен непрерывный диапазон до конца области, поэтому
-    ; освобождаем через btr напрямую. Границу модели (page_limit)
-    ; поднимаем сразу: биты «занято» за старым пределом уже стоят,
-    ; в новой области их не было, так что состояние корректно.
-    push esi
-    push edi
-
-    mov ebx, edx
-    dec ebx
-    shr ebx, PAGE_SHIFT             ; последняя страница области
-    inc ebx                         ; сколько страниц до конца области
-    cmp ebx, [page_limit]
-    jbe .limit_ok
-    mov [page_limit], ebx           ; страница №ebx ещё не входит в модель
-.limit_ok:
-    shr eax, PAGE_SHIFT             ; первая страница области
-
-.free_loop:
-    btr [bitmap], eax
-    inc eax
-    cmp eax, ebx
-    jb .free_loop
-
-    pop edi
-    pop esi
-
-.next_entry:
-    add edi, E820_ENTRY_SIZE
-    dec esi
-    jmp .entry_loop
-.entries_done:
+    mov dword [have_e820], 1
+    call pmm_clear_usable_entries   ; type == 1 -> свободно
+    call pmm_reserve_unusable_entries ; type != 1 -> занято (выигрывает)
     jmp .after_map
 
 ; ---------------------------------------------------------
@@ -311,7 +527,10 @@ pmm_init:
     jnz .have_low
     mov eax, 0x100000               ; совсем ничего не известно — 1 МиБ
 .have_low:
-    mov [e820_highest], eax
+    cmp eax, LAST_ADDR
+    jbe .low_ok
+    mov eax, LAST_ADDR
+.low_ok:
     mov ebx, eax
     dec ebx
     shr ebx, PAGE_SHIFT
@@ -319,6 +538,19 @@ pmm_init:
     mov [page_limit], ebx
     xor eax, eax
     call pmm_clear_range
+
+    ; без карты E820 сами резервируем EBDA, видеопамять и BIOS ROM
+    mov ebx, EBDA_PAGE_LAST
+    mov eax, EBDA_PAGE_FIRST
+    call pmm_mark_range
+
+    mov ebx, VGA_PAGE_LAST
+    mov eax, VGA_PAGE_FIRST
+    call pmm_mark_range
+
+    mov ebx, ROM_PAGE_LAST
+    mov eax, ROM_PAGE_FIRST
+    call pmm_mark_range
 
 .after_map:
 
@@ -331,16 +563,12 @@ pmm_init:
     xor eax, eax
     call pmm_mark_range
 
-    ; b) стек ядра: 0x80000..0x90000 (стек растёт вниз от 0x90000)
-    mov eax, KERNEL_STACK_TOP - 0x10000
-    shr eax, PAGE_SHIFT
-    mov ebx, KERNEL_STACK_TOP
-    shr ebx, PAGE_SHIFT
-    dec ebx
+    ; b) стек ядра (растёт вниз от KERNEL_STACK_TOP)
+    mov eax, STACK_BOTTOM >> PAGE_SHIFT
+    mov ebx, (KERNEL_STACK_TOP >> PAGE_SHIFT) - 1
     call pmm_mark_range
 
-    ; c) E820 не всегда описывает первую страницу (там IVT/BDA) —
-    ;    на всякий случай резервируем страницу 0 отдельно.
+    ; c) страница 0 (IVT/BDA)
     xor eax, eax
     xor ebx, ebx
     call pmm_mark_range
@@ -348,12 +576,7 @@ pmm_init:
     ; ---- 4. Посчитать свободные страницы ----
     call pmm_count_free
 
-    pop edi
-    pop esi
-    pop edx
-    pop ecx
-    pop ebx
-    pop eax
+    popad
     ret
 
 ; ---------------------------------------------------------
@@ -364,35 +587,55 @@ global pmm_alloc
 pmm_alloc:
     push ebx
     push ecx
+    push edx
 
     push pmm_lock
     call spin_lock
     add esp, 4
 
+    ; Начинаем с подсказки: без неё каждая выдача просматривала bitmap
+    ; с нуля, и N выделений подряд стоили O(N^2).
+    mov ecx, [alloc_hint]
+    cmp ecx, [page_limit]
+    jb .scan
     xor ecx, ecx
 
 .scan:
     cmp ecx, [page_limit]
-    jae .nomem
+    jae .wrap
 
-    push ecx
+    ; бит читаем напрямую из bitmap: вызов pmm_test_bit на каждую
+    ; страницу превращал поиск миллиона страниц в миллион call/ret
     mov eax, ecx
-    call pmm_test_bit
-    pop ecx
-
+    mov ebx, ecx
+    shr eax, 3                      ; номер байта bitmap
+    and ebx, 7                      ; номер бита
+    movzx edx, byte [bitmap + eax]
+    bt edx, ebx
     jnc .found                      ; бит 0 — страница свободна
 
-.next:
     inc ecx
     jmp .scan
 
+.wrap:
+    ; дошли до page_limit: если поиск начался с подсказки, часть
+    ; bitmap в начале могла быть пропущена — проверяем её РОВНО ОДИН раз.
+    ; Маркер «уже обернулись» — ALLOC_HINT_WRAPPED: без него при
+    ; полностью занятой памяти поиск бесконечно ходил по кругу.
+    cmp dword [alloc_hint], ALLOC_HINT_WRAPPED
+    je .nomem
+    mov dword [alloc_hint], ALLOC_HINT_WRAPPED
+    xor ecx, ecx
+    jmp .scan
+
 .found:
-    push ecx
+    ; занять страницу (bts с регистровым номером бита)
     mov eax, ecx
-    call pmm_set_bit                ; занять страницу
-    pop ecx
+    bts [bitmap], eax
 
     dec dword [free_pages]
+    lea edx, [ecx + 1]
+    mov [alloc_hint], edx           ; следующая выдача начнётся отсюда
 
     mov eax, ecx
     shl eax, PAGE_SHIFT             ; адрес = индекс * 4096
@@ -403,6 +646,7 @@ pmm_alloc:
     add esp, 4
     pop eax
 
+    pop edx
     pop ecx
     pop ebx
     ret
@@ -413,6 +657,7 @@ pmm_alloc:
     add esp, 4
 
     xor eax, eax
+    pop edx
     pop ecx
     pop ebx
     ret
@@ -422,14 +667,16 @@ pmm_alloc:
 ;
 ; Освобождает страницу, полученную из pmm_alloc().
 ; Игнорируются: NULL, невыровненные адреса, адреса вне модели
-; памяти, страницы вне доступных областей E820, страницы, которые
-; не были выделены, и зарезервированные области (ядро, стек).
+; памяти, страницы вне доступных областей E820 (видеопамять,
+; BIOS ROM, MMIO-дыры), страницы, которые не были выделены,
+; и зарезервированные области (ядро, стек).
 ; ---------------------------------------------------------
 global pmm_free
 pmm_free:
     push ebx
+    push edx
 
-    mov ebx, [esp + 8]              ; addr
+    mov ebx, [esp + 12]             ; addr: 4 (ret) + 4 (ebx) + 4 (edx)
     test ebx, ebx
     jz .done
 
@@ -440,7 +687,19 @@ pmm_free:
     cmp ebx, [page_limit]
     jae .done
 
-    push edx
+    ; не освобождаем всё до конца образа ядра
+    mov eax, kernel_end
+    add eax, PAGE_SIZE - 1
+    shr eax, PAGE_SHIFT             ; первая свободная страница за ядром
+    cmp ebx, eax
+    jb .done
+
+    ; не освобождаем стек ядра
+    cmp ebx, STACK_BOTTOM >> PAGE_SHIFT
+    jb .stack_ok
+    cmp ebx, (KERNEL_STACK_TOP >> PAGE_SHIFT) - 1
+    jbe .done
+.stack_ok:
 
     push pmm_lock
     call spin_lock
@@ -451,31 +710,36 @@ pmm_free:
     call pmm_test_bit
     jnc .unlock
 
-    ; не освобождаем всё до конца образа ядра
-    mov eax, kernel_end
-    add eax, PAGE_SIZE - 1
-    shr eax, PAGE_SHIFT             ; первая свободная страница за ядром
-    cmp ebx, eax
-    jb .unlock
-
-    ; не освобождаем стек ядра
-    cmp ebx, (KERNEL_STACK_TOP - 0x10000) >> PAGE_SHIFT
-    jb .really_free
-    cmp ebx, KERNEL_STACK_TOP >> PAGE_SHIFT
-    jb .unlock
+    ; страница должна принадлежать доступной памяти, иначе
+    ; «освобождение» вернёт в оборот видеопамять или MMIO
+    mov eax, ebx
+    cmp dword [have_e820], 0
+    je .legacy_check
+    call pmm_is_usable_page
+    jnc .unlock
+    jmp .really_free
+.legacy_check:
+    call pmm_is_legacy_reserved
+    jc .unlock
 
 .really_free:
     mov eax, ebx
     call pmm_clear_bit
     inc dword [free_pages]
 
+    ; освобождённая страница должна быть видна следующему поиску
+    cmp ebx, [alloc_hint]
+    jae .hint_ok
+    mov [alloc_hint], ebx
+.hint_ok:
+
 .unlock:
     push pmm_lock
     call spin_unlock
     add esp, 4
 
-    pop edx
 .done:
+    pop edx
     pop ebx
     ret
 
@@ -483,6 +747,8 @@ pmm_free:
 ; uint32_t pmm_free_pages(void)  — сколько страниц свободно
 ; uint32_t pmm_total_pages(void) — сколько страниц покрывает bitmap
 ; uint32_t pmm_usable_bytes(void)— столько байт доступной ОЗУ
+;   (значение насыщается: 4 ГиБ не влезают в 32 бита и дают
+;    0xFFFFFFFF вместо нуля после переполнения)
 ; ---------------------------------------------------------
 global pmm_free_pages
 pmm_free_pages:
@@ -496,13 +762,25 @@ pmm_total_pages:
 
 global pmm_usable_bytes
 pmm_usable_bytes:
-    mov eax, [page_limit]
+    mov edx, [page_limit]
+    test edx, edx
+    jz .zero
+    ; page_limit * 4096 переполняет 32 бита при page_limit == 1048576
+    cmp edx, 0x00100000             ; 2^20 страниц = 4 ГиБ
+    jae .saturate
+    mov eax, edx
     shl eax, PAGE_SHIFT
+    ret
+.saturate:
+    mov eax, 0xFFFFFFFF
+    ret
+.zero:
+    xor eax, eax
     ret
 
 ; ---------------------------------------------------------
 ; uint32_t pmm_e820_entries(void) — записей в карте E820
-; uint32_t pmm_e820_usable(void)  — из них доступных (type == 1)
+; uint32_t pmm_e820_usable(void)  — сколько записей дали память
 ; ---------------------------------------------------------
 global pmm_e820_entries
 pmm_e820_entries:
@@ -522,14 +800,15 @@ pmm_e820_usable:
 global pmm_e820_entry
 pmm_e820_entry:
     push ebx
+    push ecx
     push esi
     push edi
 
-    mov eax, [esp + 16]             ; index
+    mov eax, [esp + 20]             ; index
     cmp eax, [e820_entries]
     jae .fail
 
-    mov edi, [esp + 20]             ; out
+    mov edi, [esp + 24]             ; out
     test edi, edi
     jz .fail
 
@@ -546,6 +825,7 @@ pmm_e820_entry:
 .done:
     pop edi
     pop esi
+    pop ecx
     pop ebx
     ret
 

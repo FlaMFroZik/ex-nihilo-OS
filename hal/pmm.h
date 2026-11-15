@@ -6,9 +6,14 @@
 
 #define PAGE_SHIFT      12
 #define PAGE_SIZE       4096
-/* 1 бит на страницу: 1 МиБ bitmap покрывает 4 ГиБ адресного пространства. */
-#define PMM_MAX_PAGES   (1024u * 1024u * 8u)
-#define PMM_MAX_BYTES   ((uint64_t)PMM_MAX_PAGES * PAGE_SIZE)
+/* 1 бит на страницу. Bitmap в hal/pmm.asm — 128 КиБ
+ * (BITMAP_MAX_BYTES = 1 МиБ / 8), значит он покрывает
+ * 1048576 страниц = 4 ГиБ адресного пространства.
+ * Раньше здесь стояло 8 МиБ/8 = 8 МиБ бит = 32 ГиБ, что
+ * расходилось с реальным размером bitmap в 8 раз. */
+#define PMM_BITMAP_BYTES (1024u * 1024u / 8u)          /* 128 КиБ */
+#define PMM_MAX_PAGES    (PMM_BITMAP_BYTES * 8u)       /* 1048576 */
+#define PMM_MAX_BYTES    ((uint64_t)PMM_MAX_PAGES * PAGE_SIZE)  /* 4 ГиБ */
 
 /* Запись карты памяти BIOS (INT 15h, AX=E820h), как её отдаёт BIOS. */
 typedef struct {
@@ -36,7 +41,9 @@ uint32_t pmm_free_pages(void);
 /* Сколько страниц покрывает модель памяти (page_limit). */
 uint32_t pmm_total_pages(void);
 
-/* Объём доступной ОЗУ в байтах (page_limit * PAGE_SIZE). */
+/* Объём доступной ОЗУ в байтах (page_limit * PAGE_SIZE).
+ * Насыщается: при 4 ГиБ ОЗУ результат не влезает в 32 бита,
+ * поэтому возвращается 0xFFFFFFFF, а не 0 после переполнения. */
 uint32_t pmm_usable_bytes(void);
 
 /* Диагностика карты E820, полученной от BIOS. */
