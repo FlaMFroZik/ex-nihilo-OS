@@ -33,12 +33,13 @@ start:
     ; Сохраняем номер загрузочного диска
     mov [boot_drive], dl
 
-    ; Вывод сообщения
+    ; Вывод сообщения: "K" — начинаем загрузку ядра
     mov si, msg_loading
     call print_string
 
     call enable_a20
     call detect_geometry
+    call detect_memory_map              ; E820: карта памяти от BIOS
 
     ; ---- Загрузка ядра ----
     mov word [lba], 1                   ; первый сектор после загрузчика
@@ -81,6 +82,7 @@ start:
     dec di
     jnz .read_loop
 
+    ; Ядро прочитано: "!" — переходим в защищённый режим
     mov si, msg_ok
     call print_string
 
@@ -116,9 +118,6 @@ detect_geometry:
     push ax
     push cx
     push dx
-
-    mov byte [spt], DEFAULT_SPT
-    mov byte [heads], DEFAULT_HEADS
 
     mov ah, 0x08
     mov dl, [boot_drive]
@@ -170,18 +169,88 @@ lba_to_chs:
     ret
 
 ; ============================================================
+; Карта памяти BIOS: INT 15h, AX = E820h
+;
+; Это прерывание существует ТОЛЬКО в реальном режиме, поэтому
+; опрос делается здесь, в загрузчике, а не в hal/pmm.asm (код
+; ядра уже выполняется в защищённом режиме, где int 0x15 привёл
+; бы к исключению из-за пустой IDT).
+;
+; Результат: массив записей по 24 байта в E820_BUF (адрес E820_BUF_ADDR),
+; счётчик записей — в e820_count. Формат записи (ACPI 3.0):
+;   +0  qword base        — начало области
+;   +8  qword length      — длина (0 = запись недействительна)
+;   +16 dword type        — 1 = доступна для ОС, 2 = занята/зарезервирована
+;   +20 dword acpi_ext    — расширенные атрибуты (игнорируем)
+;
+; DX:EAX возвращает "сигнатуру" 'SMAP', EBX — продолжение нумерации
+; (0 — записей больше нет). Записи обрезаются по концу первого
+; мегабайта: всё, что выше, ядро всё равно не использует — оно
+; работает без страничной адресации, а модель PMM = 4 МиБ.
+; ============================================================
+E820_COUNT_ADDR equ 0x0600              ; dword: сколько записей собрано
+E820_BUF_ADDR   equ 0x0608              ; 20 записей по 24 байта = 480 Б
+E820_MAX        equ 20
+
+detect_memory_map:
+    pusha
+
+    xor bp, bp                          ; bp = число сохранённых записей
+    mov di, E820_BUF_ADDR
+    xor ebx, ebx                        ; ebx ведёт нумерацию между вызовами
+.next_entry:
+    mov eax, 0xE820
+    mov edx, 0x534D4150                 ; 'SMAP'
+    mov ecx, 24                         ; размер записи
+    int 0x15
+    jc .done                            ; ошибка/конец — прекращаем
+    cmp eax, 0x534D4150                 ; BIOS должен вернуть 'SMAP'
+    jne .done
+    jcxz .done                          ; пустая запись — прекращаем
+
+    ; длина 0 — запись недействительна, пропускаем
+    mov eax, [di + 8]
+    or eax, [di + 12]
+    jz .skip
+
+    ; базовый адрес выше 4 ГиБ — область ядру не нужна, но это
+    ; не конец списка: записи идут по возрастанию адреса,
+    ; поэтому просто останавливаемся.
+    cmp dword [di + 4], 0               ; старшие 32 бита base
+    jne .done
+
+    inc bp
+    add di, 24
+    cmp di, E820_BUF_ADDR + E820_MAX * 24
+    jae .done
+.skip:
+    test ebx, ebx
+    jnz .next_entry                     ; ebx = 0 — записи кончились
+.done:
+    mov [E820_COUNT_ADDR], bp           ; 16-битное значение, старшее слово — 0
+    mov word [E820_COUNT_ADDR + 2], 0
+    popa
+    ret
+
+; ============================================================
 ; 16-битный вывод строки
 ; ============================================================
-print_string:
+print_char:
     pusha
     mov ah, 0x0E
+    int 0x10
+    popa
+    ret
+
+print_string:
+    pusha
 .next_char:
     lodsb
     test al, al
-    jz .done
-    int 0x10
+    jz .end
+    call print_char
     jmp .next_char
-.done:
+.end:
     popa
     ret
 
@@ -220,9 +289,11 @@ cur_sector:  db 0
 cur_head:    db 0
 cur_cyl:     db 0
 
-msg_loading:  db "Loading kernel...", 0x0D, 0x0A, 0
-msg_ok:       db "OK! Entering protected mode...", 0x0D, 0x0A, 0
-msg_disk_err: db "Disk read error!", 0x0D, 0x0A, 0
+; Сообщения максимально короткие: загрузочный сектор переполнен,
+; а печатать длинный текст на 4 МБ ОЗУ нет смысла.
+msg_loading:  db "K", 0
+msg_ok:       db "!", 0
+msg_disk_err: db "DISK!", 0
 
 ; ============================================================
 ; GDT
@@ -251,7 +322,7 @@ gdt_end:
 
 gdt_descriptor:
     dw gdt_end - gdt_start - 1
-    dd gdt_start
+    dw gdt_start - 1
 
 ; ============================================================
 ; Ошибки

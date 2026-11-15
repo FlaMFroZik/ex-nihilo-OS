@@ -77,9 +77,16 @@ $(BUILD)/tests/pmm_test.o: $(TEST_DIR)/pmm_test.c hal/pmm.h libc/stdint.h libc/s
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Адреса карты E820 и ячейки BIOS переносим в .bss теста: в user
+# space 0x600/0x413 не отображены. Значения совпадают с tests/start.asm.
+TEST_E820_DEFS := -DPMM_HOST_TEST \
+                  -DE820_COUNT_ADDR=test_e820_count \
+                  -DE820_BUF_ADDR=test_e820_buf \
+                  -DBIOS_MEM_KB_ADDR=test_bios_mem_kb
+
 $(BUILD)/tests/pmm_under_test.o: hal/pmm.asm
 	@mkdir -p $(dir $@)
-	$(NASM) -f elf32 $< -o $@
+	$(NASM) -f elf32 $(TEST_E820_DEFS) $< -o $@
 
 $(BUILD)/tests/spinlock.o: hal/spinlock.asm
 	@mkdir -p $(dir $@)
