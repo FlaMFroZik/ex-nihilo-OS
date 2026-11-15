@@ -16,7 +16,7 @@ static unsigned int put_char(unsigned int row, unsigned int col, char c)
     if (row >= VGA_ROWS || col >= VGA_COLS)
         return col;                     /* за пределами экрана: пропускаем */
 
-        volatile uint8_t *cell = VGA_MEM + (row * VGA_COLS + col) * 2;
+    volatile uint8_t *cell = VGA_MEM + (row * VGA_COLS + col) * 2;
     cell[0] = (uint8_t)c;               /* символ */
     cell[1] = VGA_ATTR;                 /* атрибут */
     return col + 1;
@@ -36,6 +36,18 @@ static unsigned int out(unsigned int row, unsigned int col, const char *str)
 {
     while (*str != '\0')
         col = put_char(row, col, *str++);
+    return col;
+}
+
+/* Выводит беззнаковое число в виде 0x + 8 шестнадцатеричных цифр.
+ *   Возвращает колонку, следующую за последней цифрой. */
+static unsigned int out_hex(unsigned int row, unsigned int col, uintptr_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    col = out(row, col, "0x");
+    for (int shift = 28; shift >= 0; shift -= 4)
+        col = put_char(row, col, digits[(value >> shift) & 0xF]);
     return col;
 }
 
@@ -62,23 +74,63 @@ void kmain(void)
 {
     pmm_init();
     clear_screen();
-    out(0, 0, "Physical pages allocated by pmm_alloc():");
+
+    unsigned int row = 0;
+    unsigned int col;
+
+    col = out(row++, 0, "Physical pages allocated by pmm_alloc():");
+    (void)col;
+
+    void *pages[10];
 
     for (unsigned int i = 0; i < 10; i++) {
-        unsigned int row = i + 2;       /* строки 2..11 */
         void *page = pmm_alloc();
+        pages[i] = page;
 
-        unsigned int col = out(row, 0, "Page ");
+        col = out(row, 0, "Page ");
         col = out_dec(row, col, i);
         col = out(row, col, ": ");
 
         if (page == NULL)
             out(row, col, "OUT OF MEMORY!");
         else
-            out_dec(row, col, (uintptr_t)page);
+            out_hex(row, col, (uintptr_t)page);
+
+        row++;
     }
 
-    /* Всё сделано. Останавливаем процессор, иначе выполнение уйдет неизвестно куда */
+    /* --- проверка pmm_free() --- */
+    col = out(row++, 0, "Free pages before free(): ");
+    out_dec(row - 1, col, pmm_free_pages());
+
+    /* Освобождаем первую страницу и проверяем, что счётчик вырос */
+    pmm_free(pages[0]);
+
+    col = out(row++, 0, "Free pages after  free(): ");
+    out_dec(row - 1, col, pmm_free_pages());
+
+    /* Повторное освобождение того же адреса не должно менять состояние */
+    pmm_free(pages[0]);
+    pmm_free(NULL);             /* NULL игнорируется */
+    pmm_free((void *)0x1234);   /* невыровненный адрес игнорируется */
+
+    col = out(row++, 0, "Free pages after double free / bad args: ");
+    out_dec(row - 1, col, pmm_free_pages());
+
+    /* Освобождённая страница должна снова выдаваться аллокатором */
+    void *again = pmm_alloc();
+    col = out(row++, 0, "Reallocated page: ");
+    out_hex(row - 1, col, (uintptr_t)again);
+
+    /* Освобождаем всё остальное */
+    for (unsigned int i = 1; i < 10; i++)
+        pmm_free(pages[i]);
+    pmm_free(again);
+
+    col = out(row++, 0, "Free pages at the end: ");
+    out_dec(row - 1, col, pmm_free_pages());
+
+    /* Всё сделано. Останавливаем процессор, иначе выполнение уйдёт неизвестно куда */
     for (;;)
         __asm__ volatile ("hlt");
 }

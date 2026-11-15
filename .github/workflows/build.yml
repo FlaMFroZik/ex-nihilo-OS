@@ -1,0 +1,29 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc-multilib
+
+      - name: Build kernel image
+        run: make all
+
+      - name: Run PMM host tests
+        run: make test
+
+      - name: Show image layout
+        run: |
+          ls -l build/os.img build/kernel.bin build/boot.bin
+          # загрузчик читает не больше 32 КиБ ядра
+          test "$(stat -c%s build/kernel.bin)" -le 32768
