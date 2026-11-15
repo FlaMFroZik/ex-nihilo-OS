@@ -195,13 +195,18 @@ E820_MAX        equ 20
 detect_memory_map:
     pusha
 
-    xor bp, bp                          ; bp = число сохранённых записей
+    ; ВАЖНО: int 0x15 в реальном режиме НЕ сохраняет BP — в нём BIOS
+    ; возвращает флаг конфигурации, а EBX трогает как «продолжение
+    ; нумерации». Поэтому счётчик записей и continuation живут в
+    ; памяти, а не в регистрах: иначе часть карты терялась.
+    mov word [e820_count], 0
+    mov dword [e820_next], 0
     mov di, E820_BUF_ADDR
-    xor ebx, ebx                        ; ebx ведёт нумерацию между вызовами
 .next_entry:
     mov eax, 0xE820
     mov edx, 0x534D4150                 ; 'SMAP'
     mov ecx, 24                         ; размер записи
+    mov ebx, [e820_next]                ; продолжить с того же места
     int 0x15
     jc .done                            ; ошибка/конец — прекращаем
     cmp eax, 0x534D4150                 ; BIOS должен вернуть 'SMAP'
@@ -219,16 +224,17 @@ detect_memory_map:
     cmp dword [di + 4], 0               ; старшие 32 бита base
     jne .done
 
-    inc bp
+    inc word [e820_count]
     add di, 24
     cmp di, E820_BUF_ADDR + E820_MAX * 24
     jae .done
 .skip:
+    mov [e820_next], ebx                ; BIOS вернул новое продолжение
     test ebx, ebx
     jnz .next_entry                     ; ebx = 0 — записи кончились
 .done:
-    mov [E820_COUNT_ADDR], bp           ; 16-битное значение, старшее слово — 0
-    mov word [E820_COUNT_ADDR + 2], 0
+    movzx eax, word [e820_count]
+    mov [E820_COUNT_ADDR], eax          ; dword: старшее слово = 0
     popa
     ret
 
@@ -288,6 +294,8 @@ dest_seg:    dw 0
 cur_sector:  db 0
 cur_head:    db 0
 cur_cyl:     db 0
+e820_count:  dw 0                       ; счётчик записей (BP не сохраняется!)
+e820_next:   dd 0                       ; continuation для следующего вызова
 
 ; Сообщения максимально короткие: загрузочный сектор переполнен,
 ; а печатать длинный текст на 4 МБ ОЗУ нет смысла.

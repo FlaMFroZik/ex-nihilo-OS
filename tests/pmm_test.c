@@ -407,19 +407,94 @@ static void test_huge_and_clamped_entries(void)
     CHECK_TRUE(pmm_total_pages() > 1024);
 }
 
-static void test_zero_length_and_type2_entries(void)
+static void test_zero_length_entry_is_ignored(void)
 {
-    /* записи нулевой длины и записи type != 1 не должны освобождать память */
-    e820_add(0, 0x00000000, 0, 1);            /* нулевая длина */
-    e820_add(1, 0x00100000, 0x00100000, 2);   /* занятая область */
-    e820_add(2, 0x00100000, 0x00100000, 1);   /* та же область, но свободная */
-    e820_set_count(3);
+    /* запись нулевой длины не должна освобождать память */
+    e820_add(0, 0x00000000, 0, 1);
+    e820_add(1, 0x00100000, 0x00100000, 1);
+    e820_set_count(2);
     pmm_init();
 
-    /* запись 0 нулевой длины ничего не даёт, считается только запись 2 */
-    CHECK_EQ(pmm_e820_usable(), 1);
+    CHECK_EQ(pmm_e820_usable(), 1);           /* учтена только запись 1 */
     CHECK_EQ(pmm_total_pages(), 2u * 1024 * 1024 / PAGE_SIZE);
     CHECK_EQ(pmm_free_pages(), pmm_total_pages() - KERNEL_PAGES);
+}
+
+static void test_reserved_wins_overlap(void)
+{
+    /* BIOS иногда отдаёт пересекающиеся записи. «Занято» должно
+     * побеждать: отдать ОС страницу, которая объявлена как MMIO
+     * или прошивка, опаснее, чем потерять немного памяти. */
+    e820_add(0, 0x00100000, 0x00100000, 2);   /* занятая область */
+    e820_add(1, 0x00100000, 0x00100000, 1);   /* та же область, «свободна» */
+    e820_set_count(2);
+    pmm_init();
+
+    CHECK_EQ(pmm_free_pages(), 0);            /* пересёкшаяся область осталась занятой */
+    CHECK_TRUE(pmm_alloc() == NULL);
+}
+
+static void test_ebda_page_is_reserved(void)
+{
+    /* Классическая раскладка IBM PC: базовая память кончается на
+     * 0x9FC00, а EBDA начинается там же — обе записи делят страницу
+     * 0x9F000. Раньше эта страница оставалась «свободной», потому что
+     * сначала освобождались все type == 1. */
+    e820_add(0, 0x00000000, 0x0009FC00, 1);
+    e820_add(1, 0x0009FC00, 0x00000400, 2);   /* EBDA */
+    e820_add(2, 0x000F0000, 0x00010000, 2);   /* BIOS ROM */
+    e820_add(3, 0x00100000, 0x00F00000, 1);
+    e820_set_count(4);
+    pmm_init();
+
+    for (int i = 0; i < 20000; i++) {
+        void *p = pmm_alloc();
+        if (!p)
+            break;
+        uintptr_t addr = (uintptr_t)p;
+        CHECK_TRUE(addr != 0x9F000);                       /* EBDA */
+        CHECK_TRUE(!(addr >= 0xA0000 && addr < 0xC0000));  /* VGA */
+        CHECK_TRUE(!(addr >= 0xF0000 && addr < 0x100000)); /* BIOS ROM */
+    }
+}
+
+static void test_free_cannot_release_reserved_e820_areas(void)
+{
+    /* Раньше pmm_free() мог «освободить» видеопамять, BIOS ROM или
+     * MMIO-дыру: они помечены тем же битом «занято», что и страницы,
+     * выданные аллокатором, и проверки на зарезервированные области
+     * не было. */
+    e820_add(0, 0x00000000, 0x0009FC00, 1);
+    e820_add(1, 0x0009FC00, 0x00000400, 2);     /* EBDA */
+    e820_add(2, 0x000A0000, 0x00020000, 2);     /* VGA */
+    e820_add(3, 0x000F0000, 0x00010000, 2);     /* BIOS ROM */
+    e820_add(4, 0x00100000, 0x00F00000, 1);     /* 1..16 МиБ */
+    e820_add(5, 0x01000000, 0x03000000, 2);     /* 16..64 МиБ: MMIO-дыра */
+    e820_add(6, 0x04000000, 0x01000000, 1);     /* 64..80 МиБ */
+    e820_set_count(7);
+    pmm_init();
+
+    uint32_t before = pmm_free_pages();
+
+    pmm_free((void *)0x9F000);      /* EBDA */
+    pmm_free((void *)0xA0000);      /* VGA */
+    pmm_free((void *)0xB8000);      /* текстовый видеобуфер */
+    pmm_free((void *)0xF0000);      /* BIOS ROM */
+    pmm_free((void *)0x1000000);    /* MMIO-дыра */
+
+    CHECK_EQ(pmm_free_pages(), before);
+
+    /* и эти страницы не должны после этого выдаваться аллокатору */
+    for (int i = 0; i < 30000; i++) {
+        void *p = pmm_alloc();
+        if (!p)
+            break;
+        uintptr_t addr = (uintptr_t)p;
+        CHECK_TRUE(addr != 0x9F000);
+        CHECK_TRUE(!(addr >= 0xA0000 && addr < 0xC0000));
+        CHECK_TRUE(!(addr >= 0xF0000 && addr < 0x100000));
+        CHECK_TRUE(!(addr >= 0x1000000 && addr < 0x4000000));
+    }
 }
 
 static void test_more_than_max_entries(void)
@@ -447,6 +522,81 @@ static void test_alloc_above_4gib_never(void)
         CHECK_TRUE((uintptr_t)p < 0xFFFFF000u);
         CHECK_EQ((uintptr_t)p & (PAGE_SIZE - 1), 0);
     }
+}
+
+static void test_full_4gib_model(void)
+{
+    /* Ровно 4 ГиБ ОЗУ — предел модели. Раньше верхняя страница
+     * (0xFFFFF000) отбрасывалась как «за 4 ГиБ», page_limit выходил
+     * на 1 меньше, и pmm_usable_bytes() после умножения давал 0. */
+    e820_add(0, 0x0, 0x9FC00, 1);
+    e820_add(1, 0x100000, 0xFFF00000, 1);
+    e820_set_count(2);
+    pmm_init();
+
+    CHECK_EQ(pmm_total_pages(), 1024u * 1024u);
+    CHECK_TRUE(pmm_usable_bytes() != 0);         /* не 0 после переполнения */
+
+    /* последняя страница модели входит в неё: page_limit - 1 */
+    CHECK_EQ((pmm_total_pages() - 1) * PAGE_SIZE, 0xFFFFF000u);
+
+    /* после освобождения страницы рядом с верхом она снова выдаётся */
+    uint32_t before = pmm_free_pages();
+    void *p = pmm_alloc();
+    CHECK_TRUE(p != NULL);
+    pmm_free(p);
+    CHECK_EQ(pmm_free_pages(), before);
+}
+
+static void test_free_pages_counter_is_exact(void)
+{
+    /* free_pages теперь поддерживается инкрементально, а не
+     * пересчитывается сканированием: счётчик должен совпадать
+     * с реальным числом свободных страниц после любой серии
+     * alloc/free. */
+    setup_map_128m();
+    pmm_init();
+
+    uint32_t base = pmm_free_pages();
+    void *p1 = pmm_alloc();
+    void *p2 = pmm_alloc();
+    CHECK_EQ(pmm_free_pages(), base - 2);
+
+    pmm_free(p1);
+    CHECK_EQ(pmm_free_pages(), base - 1);
+
+    pmm_free(p1);                                /* двойное — игнор */
+    CHECK_EQ(pmm_free_pages(), base - 1);
+
+    pmm_free(p2);
+    CHECK_EQ(pmm_free_pages(), base);
+}
+
+static void test_exhaustion_terminates(void)
+{
+    /* Регрессия: после добавления «подсказки» в pmm_alloc поиск при
+     * полностью занятой памяти уходил в бесконечный цикл (подсказка
+     * сбрасывалась в 0, и обход начинался заново). Тест должен
+     * завершиться, а не зависнуть. */
+    setup_map_128m();
+    pmm_init();
+
+    uint32_t total = pmm_free_pages();
+    for (uint32_t i = 0; i < total; i++)
+        (void)pmm_alloc();
+
+    CHECK_EQ(pmm_free_pages(), 0);
+
+    /* повторные вызовы обязаны быстро возвращать NULL */
+    for (int i = 0; i < 100; i++)
+        CHECK_TRUE(pmm_alloc() == NULL);
+
+    /* и после освобождения одной страницы она снова выдаётся */
+    void *p = (void *)(KERNEL_PAGES * PAGE_SIZE);
+    pmm_free(p);
+    CHECK_EQ(pmm_free_pages(), 1);
+    CHECK_TRUE(pmm_alloc() != NULL);
+    CHECK_EQ(pmm_free_pages(), 0);
 }
 
 static void test_stress_alloc_free(void)
@@ -508,9 +658,15 @@ int test_main(void)
     RUN(test_free_rejects_reserved);
     RUN(test_no_e820_fallback);
     RUN(test_huge_and_clamped_entries);
-    RUN(test_zero_length_and_type2_entries);
+    RUN(test_zero_length_entry_is_ignored);
+    RUN(test_reserved_wins_overlap);
+    RUN(test_ebda_page_is_reserved);
+    RUN(test_free_cannot_release_reserved_e820_areas);
     RUN(test_more_than_max_entries);
     RUN(test_alloc_above_4gib_never);
+    RUN(test_full_4gib_model);
+    RUN(test_free_pages_counter_is_exact);
+    RUN(test_exhaustion_terminates);
     RUN(test_stress_alloc_free);
     RUN(test_reinit_is_idempotent);
     RUN(test_spinlock_basic);
