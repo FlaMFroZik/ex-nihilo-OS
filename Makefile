@@ -13,7 +13,17 @@ LD          ?= ld
 
 BUILD       := build
 BOOT_BIN    := $(BUILD)/boot.bin
+BOOT2_BIN   := $(BUILD)/boot2.bin
 KERNEL_BIN  := $(BUILD)/kernel.bin
+
+# Раскладка образа (в секторах по 512 Б):
+#   0                   — первый этап (boot.asm, ровно 512 Б)
+#   1 .. STAGE2_SECTORS — второй этап (boot2.asm)
+#   дальше              — ядро (kernel.bin)
+# Значения обязаны совпадать с константами в boot.asm/boot2.asm;
+# проверка соответствия — targets/layout-check в `make test`.
+STAGE2_SECTORS := 2
+KERNEL_LBA     := $(shell expr 1 + $(STAGE2_SECTORS))
 IMAGE       := $(BUILD)/os.img
 
 CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-builtin \
@@ -32,13 +42,24 @@ ASM_OBJS    := $(patsubst %.asm,$(BUILD)/asm/%.o,$(ASM_SRCS))
 
 TEST_DIR    := tests
 TEST_BIN    := $(BUILD)/pmm_test
+BOOTEMU     := tools/bootemu.py
 
-.PHONY: all run test clean
+# unicorn нужен только для эмуляционной проверки загрузчика.
+# Если его нет — цель пропускается с предупреждением, а не падает.
+PYTHON      ?= python3
+HAVE_UNICORN := $(shell $(PYTHON) -c "import unicorn" 2>/dev/null && echo 1)
+
+.PHONY: all run test boottest clean
 
 all: $(IMAGE)
 
 # --- загрузочный сектор ---
 $(BOOT_BIN): boot.asm
+	@mkdir -p $(BUILD)
+	$(NASM) -f bin $< -o $@
+
+# --- второй этап загрузки ---
+$(BOOT2_BIN): boot2.asm
 	@mkdir -p $(BUILD)
 	$(NASM) -f bin $< -o $@
 
@@ -58,11 +79,12 @@ $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 	  (echo "error: kernel.bin exceeds the 32 KiB the bootloader loads" && rm -f $@ && exit 1)
 	@echo "built $@ (`stat -c%s $@` bytes)"
 
-# --- образ дискеты 1.44 МБ: сектор 0 — загрузчик, дальше — ядро ---
-$(IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
+# --- образ дискеты 1.44 МБ ---
+$(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN)
 	dd if=/dev/zero of=$@ bs=512 count=2880 status=none
 	dd if=$(BOOT_BIN)   of=$@ bs=512 conv=notrunc status=none
-	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=1 conv=notrunc status=none
+	dd if=$(BOOT2_BIN)  of=$@ bs=512 seek=1 conv=notrunc status=none
+	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=$(KERNEL_LBA) conv=notrunc status=none
 	@echo "built $@ (`stat -c%s $@` bytes)"
 
 run: $(IMAGE)
@@ -98,6 +120,28 @@ $(TEST_BIN): $(BUILD)/tests/start.o $(BUILD)/tests/pmm_test.o \
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
+
+# --- проверка раскладки образа (совпадение констант Makefile и asm) ---
+layout-check: $(IMAGE)
+	@test "$$(stat -c%s $(BOOT_BIN))" -eq 512 || \
+	  (echo "error: boot.bin должен быть ровно 512 байт" && exit 1)
+	@test "$$(stat -c%s $(BOOT2_BIN))" -eq $$((512 * $(STAGE2_SECTORS))) || \
+	  (echo "error: boot2.bin не совпадает с STAGE2_SECTORS" && exit 1)
+	@# первый сектор ядра в образе обязан совпасть с первым сектором kernel.bin
+	@dd if=$(IMAGE) bs=512 skip=$(KERNEL_LBA) of=$(BUILD)/img_k.bin \
+	  count=1 status=none
+	@dd if=$(KERNEL_BIN) of=$(BUILD)/ker_k.bin bs=512 count=1 status=none
+	@cmp -s $(BUILD)/img_k.bin $(BUILD)/ker_k.bin || \
+	  (echo "error: ядро в образе не на месте KERNEL_LBA=$(KERNEL_LBA)" && exit 1)
+	@echo "layout ok: boot=сектор 0, boot2=1..$(STAGE2_SECTORS), kernel=$(KERNEL_LBA).."
+
+# --- эмуляционная проверка загрузчика (нужен unicorn) ---
+boottest: $(IMAGE) $(KERNEL_BIN)
+ifdef HAVE_UNICORN
+	$(PYTHON) $(BOOTEMU) $(IMAGE) $(KERNEL_BIN)
+else
+	@echo "boottest: пропущено — не установлен unicorn (pip install unicorn)"
+endif
 
 clean:
 	rm -rf $(BUILD)
