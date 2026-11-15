@@ -89,38 +89,61 @@ static unsigned int out_dec(unsigned int row, unsigned int col, uintptr_t value)
 /* Текущая строка вывода: все сообщения идут вниз, экран прокручивается */
 static unsigned int cursor_row;
 
-/* Вывести строку с текущей позиции и перейти на следующую.
- *   Прокручивает экран, когда строки кончились. */
-static void emit(const char *str, unsigned int indent)
+/* Начать новую строку, прокрутив экран при необходимости */
+static void newline(void)
 {
+    cursor_row++;
     if (cursor_row >= VGA_ROWS) {
         scroll();
         cursor_row = VGA_ROWS - 1;
     }
-    out(cursor_row, indent, str);
-    cursor_row++;
 }
 
-/* То же, но с числом в конце строки */
+/* Вывести строку целиком (с нуля), затем перейти на следующую */
+static void emit(const char *str)
+{
+    out(cursor_row, 0, str);
+    newline();
+}
+
+/* "prefix<dec>suffix" одной строкой */
 static void emit_dec(const char *prefix, uintptr_t value, const char *suffix)
 {
     unsigned int col = out(cursor_row, 0, prefix);
     col = out_dec(cursor_row, col, value);
     out(cursor_row, col, suffix);
-    cursor_row++;
+    newline();
 }
 
-/* Строка с hex-числом в середине: "base=0x........ len=0x........ type=N" */
-static void emit_entry(const char *label, uintptr_t base,
-                       uintptr_t length, uintptr_t type)
+/* "prefix<hex>suffix" одной строкой */
+static void emit_hex(const char *prefix, uintptr_t value, const char *suffix)
 {
-    unsigned int col = out(cursor_row, 1, label);
-    col = out_hex(cursor_row, col, base);
+    unsigned int col = out(cursor_row, 0, prefix);
+    col = out_hex(cursor_row, col, value);
+    out(cursor_row, col, suffix);
+    newline();
+}
+
+/* Одна запись карты E820 с полным разбором:
+ *   [i] base=0x........ len=0x........ type=N free|used  pages=N */
+static void emit_entry(uint32_t index, const e820_entry_t *e)
+{
+    unsigned int col;
+
+    col = out(cursor_row, 0, "[");
+    col = out_dec(cursor_row, col, index);
+    col = out(cursor_row, col, "] base=");
+    col = out_hex(cursor_row, col, (uintptr_t)e->base);
     col = out(cursor_row, col, " len=");
-    col = out_hex(cursor_row, col, length);
+    col = out_hex(cursor_row, col, (uintptr_t)e->length);
     col = out(cursor_row, col, " type=");
-    out_dec(cursor_row, col, type);
-    cursor_row++;
+    col = out_dec(cursor_row, col, e->type);
+
+    /* сколько страниц по 4 КиБ приносит эта запись */
+    col = out(cursor_row, col, (e->type == 1) ? " free pages=" : " used pages=");
+    out_dec(cursor_row, col, (uintptr_t)(e->length / PAGE_SIZE));
+
+    newline();
 }
 
 void kmain(void)
@@ -129,104 +152,94 @@ void kmain(void)
     clear_screen();
     cursor_row = 0;
 
-    emit("E820 memory map from BIOS (INT 15h/AX=E820h):", 0);
+    /* ================= 1. Карта памяти от BIOS ================= */
+    emit("=== ex-nihilo-OS: physical memory report ===");
+    emit("Memory map source: BIOS INT 15h, AX=E820h");
+    emit_dec("E820 entries: ", pmm_e820_entries(),
+             " (regions reported by firmware)");
+    emit_dec("  of them usable (type=1): ", pmm_e820_usable(), "");
 
     uint32_t entries = pmm_e820_entries();
-    uint32_t usable  = pmm_e820_usable();
-
-    /* "Entries: 6, usable: 3" одной строкой, без склейки col вручную */
-    {
-        unsigned int col = out(cursor_row, 0, "Entries: ");
-        col = out_dec(cursor_row, col, entries);
-        col = out(cursor_row, col, ", usable: ");
-        out_dec(cursor_row, col, usable);
-        cursor_row++;
-    }
-
-    /* Карта бывает длиннее экрана: показываем ВСЕ записи,
-     * лишние строки прокручиваются вверх */
     for (uint32_t i = 0; i < entries; i++) {
         e820_entry_t e;
-
-        if (!pmm_e820_entry(i, &e))
-            continue;
-
-        /* base и length — 64-битные: показываем младшие 32 бита,
-         * всё, что выше, всё равно вне модели (см. hal/pmm.asm) */
-        emit_entry("base=", (uintptr_t)e.base, (uintptr_t)e.length, e.type);
+        if (pmm_e820_entry(i, &e))
+            emit_entry(i, &e);
     }
 
-    emit_dec("PMM usable RAM (KiB): ", pmm_usable_bytes() / 1024, "");
+    emit("");
 
-    {
-        unsigned int col = out(cursor_row, 0, "Pages total/free: ");
-        col = out_dec(cursor_row, col, pmm_total_pages());
-        col = out(cursor_row, col, "/");
-        out_dec(cursor_row, col, pmm_free_pages());
-        cursor_row++;
-    }
+    /* ================= 2. Арифметика по страницам ================= */
+    emit("--- 4 KiB page accounting ---");
+    emit_dec("Usable pages from E820 (type=1): ", pmm_usable_pages(),
+             " x 4096 B");
+    emit_dec("  = total usable RAM, KiB:        ", pmm_usable_bytes() / 1024, "");
+    emit_dec("Pages reserved for kernel image:  ", pmm_kernel_pages(),
+             " x 4096 B");
+    emit_dec("Pages free for allocation:        ", pmm_free_pages(),
+             " x 4096 B");
+    emit_dec("  = free RAM, KiB:                ", pmm_free_pages() * 4, "");
+    emit_dec("Highest page index in model:      ", pmm_total_pages() - 1, "");
+    emit_hex("Top address covered by bitmap:    ", pmm_total_pages() * PAGE_SIZE, "");
+    emit("");
 
-    /* --- выделяем 10 страниц --- */
+    /* ================= 3. Демонстрация alloc/free ================= */
+    emit("--- pmm_alloc() demo: 10 pages ---");
+
     void *pages[10];
-
     for (unsigned int i = 0; i < 10; i++) {
-        void *page = pmm_alloc();
-        pages[i] = page;
+        pages[i] = pmm_alloc();
 
         unsigned int col = out(cursor_row, 0, "Page ");
         col = out_dec(cursor_row, col, i);
         col = out(cursor_row, col, ": ");
 
-        if (page == NULL)
+        if (pages[i] == NULL) {
             out(cursor_row, col, "OUT OF MEMORY!");
-        else
-            out_hex(cursor_row, col, (uintptr_t)page);
-
-        cursor_row++;
+        } else {
+            col = out_hex(cursor_row, col, (uintptr_t)pages[i]);
+            col = out(cursor_row, col, " (index ");
+            col = out_dec(cursor_row, col, (uintptr_t)pages[i] / PAGE_SIZE);
+            out(cursor_row, col, ")");
+        }
+        newline();
     }
+    emit_dec("Free pages after 10 allocations:   ", pmm_free_pages(), "");
+    emit("");
 
-    /* --- проверка pmm_free() --- */
-    emit_dec("Free pages before free(): ", pmm_free_pages(), "");
+    /* ================= 4. Проверка pmm_free() ================= */
+    emit("--- pmm_free() behaviour ---");
 
+    uint32_t before = pmm_free_pages();
     pmm_free(pages[0]);
+    emit_dec("After free(page0) free pages:      ", pmm_free_pages(),
+             (pmm_free_pages() == before + 1) ? "  [ok +1]" : "  [BUG]");
 
-    emit_dec("Free pages after  free(): ", pmm_free_pages(), "");
+    emit_dec("Free pages now:                   ", pmm_free_pages(), "");
 
-    /* Повторное освобождение того же адреса не должно менять состояние */
-    pmm_free(pages[0]);
-    pmm_free(NULL);             /* NULL игнорируется */
-    pmm_free((void *)0x1234);   /* невыровненный адрес игнорируется */
+    /* повторное освобождение и мусорные аргументы */
+    uint32_t guard = pmm_free_pages();
+    pmm_free(pages[0]);                 /* двойное освобождение */
+    pmm_free(NULL);                     /* NULL */
+    pmm_free((void *)0x1234);           /* невыровненный адрес */
+    emit_dec("After double free/NULL/unaligned: ", pmm_free_pages(),
+             (pmm_free_pages() == guard) ? "  [ok, unchanged]" : "  [BUG]");
 
-    emit_dec("Free pages after double free / bad args: ", pmm_free_pages(), "");
+    /* попытка освободить зарезервированное */
+    guard = pmm_free_pages();
+    pmm_free((void *)0xB8000);          /* видеопамять VGA */
+    pmm_free((void *)0x10000);          /* код ядра */
+    pmm_free((void *)0xF0000);          /* BIOS ROM */
+    emit_dec("After freeing VGA/kernel/ROM:     ", pmm_free_pages(),
+             (pmm_free_pages() == guard) ? "  [ok, protected]" : "  [BUG]");
+    emit("");
 
-    /* --- попытка освободить видеопамять и код ядра: должно быть
-     *     проигнорировано (иначе ОС отдала бы их под данные) --- */
-    {
-        uint32_t before = pmm_free_pages();
-        pmm_free((void *)0xB8000);      /* видеопамять */
-        pmm_free((void *)0x10000);      /* код ядра */
+    /* ================= 5. Итог ================= */
+    emit("--- final state ---");
+    emit_dec("Free pages remaining:             ", pmm_free_pages(), "");
+    emit_dec("Free RAM remaining, KiB:          ", pmm_free_pages() * 4, "");
 
-        unsigned int col = out(cursor_row, 0, "Reserved free attempts changed counter: ");
-        out_dec(cursor_row, col, before != pmm_free_pages());
-        cursor_row++;
-    }
-
-    /* Освобождённая страница должна снова выдаваться аллокатором */
-    void *again = pmm_alloc();
-    {
-        unsigned int col = out(cursor_row, 0, "Reallocated page: ");
-        out_hex(cursor_row, col, (uintptr_t)again);
-        cursor_row++;
-    }
-
-    /* Освобождаем всё остальное */
-    for (unsigned int i = 1; i < 10; i++)
-        pmm_free(pages[i]);
-    pmm_free(again);
-
-    emit_dec("Free pages at the end: ", pmm_free_pages(), "");
-
-    /* Всё сделано. Останавливаем процессор, иначе выполнение уйдёт неизвестно куда */
+    /* Всё сделано. Останавливаем процессор. */
+    emit("System halted (hlt loop).");
     for (;;)
         __asm__ volatile ("hlt");
 }

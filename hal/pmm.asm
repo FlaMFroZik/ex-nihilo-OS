@@ -88,6 +88,7 @@ section .bss
     alloc_hint      resd 1                  ; с какой страницы начинать поиск
     e820_entries    resd 1                  ; сколько записей реально прочитано
     e820_usable     resd 1                  ; сколько из них дали память
+    usable_pages    resd 1                  ; страниц по 4 КиБ в областях type == 1
 
 section .text
 extern spin_lock
@@ -196,6 +197,12 @@ pmm_clear_usable_entries:
     inc dword [e820_usable]
 
     shr eax, PAGE_SHIFT             ; первая страница области
+
+    ; учесть, сколько страниц по 4 КиБ принесла эта область
+    mov ebx, ecx
+    sub ebx, eax
+    add [usable_pages], ebx
+
 .free_loop:
     btr [bitmap], eax
     inc eax
@@ -496,6 +503,7 @@ pmm_init:
     mov dword [page_limit], 0
     mov dword [free_pages], 0
     mov dword [e820_usable], 0
+    mov dword [usable_pages], 0
     mov dword [have_e820], 0
     mov dword [alloc_hint], 0
 
@@ -790,6 +798,28 @@ pmm_e820_entries:
 global pmm_e820_usable
 pmm_e820_usable:
     mov eax, [e820_usable]
+    ret
+
+; ---------------------------------------------------------
+; uint32_t pmm_usable_pages(void)
+;   Сколько страниц по 4 КиБ объявлено доступными (type == 1)
+;   в карте E820 — до вычета ядра, стека и прочих резервов.
+; ---------------------------------------------------------
+global pmm_usable_pages
+pmm_usable_pages:
+    mov eax, [usable_pages]
+    ret
+
+; ---------------------------------------------------------
+; uint32_t pmm_kernel_pages(void)
+;   Сколько страниц по 4 КиБ занимает образ ядра (включая загрузчик
+;   и всё до kernel_end) — они всегда заняты.
+; ---------------------------------------------------------
+global pmm_kernel_pages
+pmm_kernel_pages:
+    mov eax, kernel_end
+    add eax, PAGE_SIZE - 1
+    shr eax, PAGE_SHIFT
     ret
 
 ; ---------------------------------------------------------
