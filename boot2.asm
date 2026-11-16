@@ -21,7 +21,7 @@
 
 ; Общие константы с boot.asm (файлы собираются по отдельности,
 ; поэтому объявлены в обоих).
-STAGE2_SECTORS  equ 2
+STAGE2_SECTORS  equ 4                   ; 4 сектора = 2048 Б
 BOOT_DRIVE_ADDR equ 0x0500              ; сюда boot.asm кладёт номер диска
 
 KERNEL_START    equ 0x10000             ; физический адрес загрузки ядра
@@ -38,6 +38,30 @@ E820_COUNT_ADDR equ 0x0600              ; dword: сколько записей �
 E820_BUF_ADDR   equ 0x0608              ; 20 записей по 24 байта = 480 Б
 E820_MAX        equ 20
 
+; --- Видеорежим и шрифт (общая область для ядра) ---
+;
+; Адреса кратны 16, чтобы ядро могло описывать их как массивы байт и
+; как dword-поля без выравнивающих дыр.
+;
+;   VIDEO_INFO_ADDR + 0  u32 ширины в пикселях
+;                   + 4  u32 высоты в пикселях
+;                   + 8  u32 длина строки в байтах (BytesPerScanLine)
+;                   +12  u32 физический адрес видеопамяти (LFB)
+;                   +16  u32 байт на пиксель (3 = 32bpp, 2 = 16bpp)
+;                   +20  u32 1, если режим установлен; 0 — остались в тексте
+;
+;   FONT_ADDR            шрифт 8x16 целиком, 256 символов x 16 байт =
+;                        4096 Б. Копия ROM-шрифта, полученного через
+;                        INT 10h/AX=1130h (BH=06h): ядро не зависит от
+;                        того, по какому адресу BIOS держит шрифт.
+VIDEO_INFO_ADDR equ 0x0500
+FONT_ADDR       equ 0x0600 + 0x1000     ; 0x1600: сразу за картой E820
+FONT_BYTES      equ 4096
+
+; Идентификатор нужного режима VBE: 1024x768x32
+VBE_WANT_W      equ 1024
+VBE_WANT_H      equ 768
+
     xor ax, ax
     mov ds, ax
     mov es, ax
@@ -46,7 +70,7 @@ E820_MAX        equ 20
     cld
 
     call detect_geometry                ; геометрия диска от BIOS
-    call detect_memory_map
+    call detect_memory_map              ; E820: карта памяти от BIOS
 
     ; Сообщить, сколько регионов нашлось (одна цифра, 10+ -> '9')
     mov si, msg_e820
@@ -60,6 +84,11 @@ E820_MAX        equ 20
     call print_char
     mov si, msg_e820_end
     call print_string
+
+    ; ---- Видеорежим: VBE 1024x768x32 + ROM-шрифт 8x16 ----
+    ; Делается до загрузки ядра: после перехода в защищённый режим
+    ; INT 10h недоступен, а шрифт и параметры кадра нужны ядру.
+    call setup_video
 
     ; ---- Загрузка ядра ----
     mov word [lba], KERNEL_LBA
@@ -88,6 +117,125 @@ E820_MAX        equ 20
     mov cr0, eax
 
     jmp 0x08:protected_mode
+
+; ============================================================
+; setup_video — установить графический режим VBE и получить шрифт
+;
+; Зачем: в 80x25 помещается 25 строк, а отчёт ядра длиннее и верх
+; прокручивается. В 1024x768 при шрифте 8x16 получается 128x48
+; символов — отчёт виден целиком, без прокрутки.
+;
+; Как ищется режим: перебираем список режимов из VbeInfoBlock и берём
+; первый, который удовлетворяет всем условиям сразу —
+;   ModeAttributes: bit0 (режим есть) и bit7 (есть линейный буфер);
+;   размеры 1024x768; 32 бита на пиксель; одна плоскость.
+; Номер режима НЕ зашит: 0x118 есть не везде, а список от BIOS
+; авторитетнее.
+;
+; Всё, что нужно ядру (размеры, шаг строки, адрес LFB, bpp) и сам
+; шрифт, сохраняется в общую область — см. VIDEO_INFO_ADDR выше.
+;
+; Если VBE нет или подходящего режима не нашлось, остаёмся в текстовом
+; режиме: VIDEO_INFO_ADDR+20 = 0, и ядро печатает через 0xB8000.
+; ============================================================
+setup_video:
+    pusha
+
+    mov dword [VIDEO_INFO_ADDR + 20], 0     ; по умолчанию — текстовый режим
+
+    ; ---- 1. VbeInfoBlock ----
+    mov di, vbe_info
+    mov ax, 0x4F00
+    int 0x10
+    cmp ax, 0x004F
+    jne .no_vbe
+    cmp dword [vbe_info], 'VESA'            ; сигнатура
+    jne .no_vbe
+
+    ; ---- 2. Перебор списка режимов ----
+    ; VideoModePtr — far-указатель real-mode: младшее слово смещение,
+    ; старшее — сегмент.
+    mov si, [vbe_info + 14]
+    mov ax, [vbe_info + 16]
+    mov fs, ax                              ; FS:SI -> список u16
+
+.next_mode:
+    mov cx, [fs:si]
+    cmp cx, 0xFFFF
+    je .no_vbe
+    add si, 2
+
+    ; ModeInfoBlock для этого режима
+    push si
+    push fs
+    mov di, mode_info
+    mov ax, 0x4F01
+    int 0x10
+    pop fs
+    pop si
+    cmp ax, 0x004F
+    jne .next_mode
+
+    ; bit0 — режим поддерживается, bit7 — доступен линейный буфер
+    mov ax, [mode_info + 0]
+    and ax, 0x0081
+    cmp ax, 0x0081
+    jne .next_mode
+
+    cmp word [mode_info + 18], VBE_WANT_W
+    jne .next_mode
+    cmp word [mode_info + 20], VBE_WANT_H
+    jne .next_mode
+    cmp byte [mode_info + 25], 32           ; бит на пиксель
+    jne .next_mode
+    cmp byte [mode_info + 24], 1            ; одна плоскость
+    jne .next_mode
+
+    ; ---- 3. Установить режим ----
+    ; BX = номер режима | 0x4000 (использовать линейный буфер)
+    mov bx, cx
+    or bx, 0x4000
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    jne .no_vbe
+
+    ; ---- 4. Сохранить параметры кадра для ядра ----
+    movzx eax, word [mode_info + 18]
+    mov [VIDEO_INFO_ADDR + 0], eax          ; ширина
+    movzx eax, word [mode_info + 20]
+    mov [VIDEO_INFO_ADDR + 4], eax          ; высота
+    movzx eax, word [mode_info + 16]
+    mov [VIDEO_INFO_ADDR + 8], eax          ; шаг строки
+    mov eax, [mode_info + 40]
+    mov [VIDEO_INFO_ADDR + 12], eax         ; физический адрес LFB
+    movzx eax, byte [mode_info + 25]
+    mov [VIDEO_INFO_ADDR + 16], eax         ; байт на пиксель
+    mov dword [VIDEO_INFO_ADDR + 20], 1     ; режим установлен
+
+    ; ---- 5. Шрифт 8x16 из ROM ----
+    ; AX=1130h, BH=06h: ES:BP = адрес ROM-шрифта, CX = 16 байт на
+    ; символ, DL = число строк - 1. Копируем все 256 символов в свою
+    ; область: ядро не будет зависеть от сегмента ROM конкретного BIOS.
+    mov ax, 0x1130
+    mov bh, 0x06
+    int 0x10                                ; ES:BP -> шрифт
+    mov si, bp
+    mov ax, es
+    mov fs, ax
+    mov di, FONT_ADDR
+    mov cx, FONT_BYTES
+.copy_font:
+    mov al, [fs:si]
+    mov [di], al
+    inc si
+    inc di
+    dec cx
+    jnz .copy_font
+
+.no_vbe:
+    popa
+    ret
 
 ; ============================================================
 ; read_sector — прочитать сектор [lba] по ES:[dest_off]
@@ -299,6 +447,11 @@ heads:       dw 0
 e820_count:  dw 0
 e820_next:   dd 0
 
+; Буферы VBE. VbeInfoBlock — 512 байт, ModeInfoBlock — 256.
+alignb 4
+vbe_info:    times 512 db 0
+mode_info:   times 256 db 0
+
 msg_e820:     db "E820: ", 0
 msg_e820_end: db " regions (max 20)", 0x0D, 0x0A, 0
 msg_ok:       db "OK, booting", 0x0D, 0x0A, 0
@@ -319,7 +472,7 @@ gdt_descriptor:
     dw gdt_end - gdt_start - 1
     dw gdt_start                        ; ORG 0x7E00 → адрес уже абсолютный
 
-%if ($ - $$) > 1024
-    %error "boot2.asm: second stage exceeds 1024 bytes"
+%if ($ - $$) > 2048
+    %error "boot2.asm: second stage exceeds 2048 bytes"
 %endif
-times 1024 - ($ - $$) db 0
+times 2048 - ($ - $$) db 0

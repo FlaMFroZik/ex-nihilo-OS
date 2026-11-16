@@ -4,7 +4,7 @@
 Раскладка (см. fs/fat16.h):
 
     сектор 0      boot.asm          (ровно 512 Б)
-    сектор 1..2   boot2.asm         (2 сектора)
+    сектор 1..4   boot2.asm         (4 сектора)
     сектор 3..63  kernel.bin        (запас под рост ядра)
     сектор 64..   FAT16 на весь остаток образа
 
@@ -26,7 +26,7 @@ except ImportError:
     sys.exit("mkfatimg: нужен pyfatfs (pip install pyfatfs)")
 
 SECTOR = 512
-BOOT2_SECTORS = 2                       # должно совпадать с boot.asm
+BOOT2_SECTORS = 4                       # должно совпадать с boot.asm
 FAT_BASE_LBA = 64                       # совпадает с Makefile и hal/ata.h
 IMAGE_SECTORS = 32768                   # 16 МиБ
 IMAGE_BYTES = IMAGE_SECTORS * SECTOR
