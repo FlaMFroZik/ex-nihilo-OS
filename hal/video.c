@@ -13,8 +13,11 @@
 #include "hal/video.h"
 
 /* Общая область, заполненная boot2.asm. */
-#define VIDEO_INFO_ADDR  0x0500u
-#define FONT_ADDR        0x1600u        /* копия ROM-шрифта, 4096 Б */
+/* 0x0500 занят номером загрузочного диска (BOOT_DRIVE_ADDR), поэтому
+ * параметры кадра лежат после карты E820, а шрифт — за ними.
+ * Адреса обязаны совпадать с boot2.asm. */
+#define VIDEO_INFO_ADDR  0x0900u
+#define FONT_ADDR        0x1000u        /* копия ROM-шрифта, 4096 Б */
 
 /* Поля читаем по отдельности, через volatile-указатель на dword.
  *
@@ -29,7 +32,9 @@ static uint32_t info_field(uint32_t off)
     return *(volatile uint32_t *)(info_base + off);
 }
 
-#define FONT  ((const uint8_t *)FONT_ADDR)
+/* База шрифта — тоже переменная: на константном адресе gcc снова
+ * доказывает выход за границы массива и падает с -Werror=array-bounds. */
+static const uint8_t *font;
 
 /* Текстовый режим 0xB8000 (запасной вариант). */
 #define TEXT_MEM   ((volatile uint8_t *)0xB8000)
@@ -48,6 +53,7 @@ int video_init(void)
     uint32_t info_w, info_h, info_pitch, info_lfb, info_bpp, info_active;
 
     info_base = VIDEO_INFO_ADDR;
+    font = (const uint8_t *)FONT_ADDR;
 
     info_w      = info_field(0);
     info_h      = info_field(4);
@@ -146,7 +152,7 @@ void video_putc(unsigned int row, unsigned int col, char c)
 
     uint32_t x = col * VIDEO_GLYPH_W;
     uint32_t y = row * VIDEO_GLYPH_H;
-    const uint8_t *glyph = FONT + ((uint8_t)c) * VIDEO_GLYPH_H;
+    const uint8_t *glyph = font + ((uint8_t)c) * VIDEO_GLYPH_H;
 
     /* Шрифт 8x16: каждый байт — строка, старший бит — левый пиксель. */
     for (uint32_t gy = 0; gy < VIDEO_GLYPH_H; gy++) {
