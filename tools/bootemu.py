@@ -68,8 +68,10 @@ VBE_MODE_LIST = 0x4600
 VBE_MODE_NUMBER = 0x144         # 1024x768x32 по спецификации VBE
 
 # Области, которые загрузчик заполняет для ядра (см. boot2.asm)
-VIDEO_INFO_ADDR = 0x0500
-FONT_ADDR = 0x1600
+BOOT_DRIVE_ADDR = 0x0500         # boot.asm: номер загрузочного диска
+E820_BUF_ADDR = 0x0608          # boot2.asm: 20 записей по 24 байта
+VIDEO_INFO_ADDR = 0x0900
+FONT_ADDR = 0x1000
 FAILED = []
 
 # Регистры ATA
@@ -195,10 +197,16 @@ def main():
 
     mu = Uc(UC_ARCH_X86, UC_MODE_16)
     mu.mem_map(0, 0x100000 + 0x1000000)          # 16 МиБ + низкая память
+    # BIOS передаёт номер загрузочного диска в DL: 0x80 — первый HDD.
+    # Раньше эмулятор DL не выставлял, поэтому «поехавший» номер диска
+    # в памяти обнаруживался не сразу, а только по мусору в результате.
+    BOOT_DRIVE = 0x80
+    mu.reg_write(UC_X86_REG_DL, BOOT_DRIVE)
     mu.mem_write(0x7C00, bytes(disk.img[0:512]))
     mu.mem_write(0x7E00, bytes(disk.img[512:512 + STAGE2_SECTORS * 512]))
 
     screen, reads, bad_chs, lba_calls = [], [], [], []
+    bad_drive = []
 
     # Карта как у QEMU: 0xA0000..0x100000 (VGA + BIOS ROM) — reserved,
     # иначе ядро справедливо сочтёт видеопамять свободной.
@@ -312,6 +320,20 @@ def main():
             return
         if intno != 0x13:
             return
+
+        # Настоящий BIOS ищет диск по номеру в DL и с чужим номером
+        # возвращает CF=1. Эмулятор этого не делал, поэтому порча
+        # ячейки с номером диска проходила незамеченной — именно так
+        # «съехавший» VIDEO_INFO_ADDR превращался в чёрный экран на
+        # реальной машине при зелёном CI.
+        dl = mu.reg_read(UC_X86_REG_DL)
+        if dl != BOOT_DRIVE:
+            bad_drive.append(dl)
+            mu.reg_write(UC_X86_REG_AH, 0x01)
+            mu.reg_write(UC_X86_REG_EFLAGS,
+                         mu.reg_read(UC_X86_REG_EFLAGS) | 1)
+            return
+
         if ah == 0x02:
             count = mu.reg_read(UC_X86_REG_AL)
             ch = mu.reg_read(UC_X86_REG_CH)
@@ -385,6 +407,30 @@ def main():
     check("E820:" in text and "regions" in text, "второй этап собрал карту E820")
     check("OK, booting" in text, "второй этап дошёл до перехода в PM")
     check(not lba_calls, "загрузчик не использует AH=42h")
+
+    print("\nПамять загрузчика:")
+    check(not bad_drive,
+          "все INT 13h вызваны с номером загрузочного диска (DL=%#x)%s"
+          % (BOOT_DRIVE,
+             "" if not bad_drive else ", а встретились: %s"
+             % sorted(set(hex(d) for d in bad_drive))))
+    # Области, которые загрузчик заполняет для ядра, не должны
+    # пересекаться: карта E820 (0x0600..0x07E7), параметры кадра и
+    # шрифт. Наложение уже один раз дало чёрный экран.
+    check(VIDEO_INFO_ADDR + 24 <= FONT_ADDR or FONT_ADDR + FONT_BYTES <= VIDEO_INFO_ADDR,
+          "параметры кадра и шрифт не накладываются друг на друга "
+          "(кадр %#x..%#x, шрифт %#x..%#x)"
+          % (VIDEO_INFO_ADDR, VIDEO_INFO_ADDR + 24,
+             FONT_ADDR, FONT_ADDR + 4096))
+    check(FONT_ADDR + 4096 <= 0x7C00,
+          "шрифт не залезает в загрузочный сектор (конец %#x < 0x7C00)"
+          % (FONT_ADDR + 4096))
+    check(VIDEO_INFO_ADDR >= E820_BUF_ADDR + 20 * 24,
+          "параметры кадра лежат за картой E820 (%#x..%#x)"
+          % (E820_BUF_ADDR, E820_BUF_ADDR + 20 * 24))
+    check(BOOT_DRIVE_ADDR < VIDEO_INFO_ADDR,
+          "адрес номера диска (%#x) не перекрыт параметрами кадра (%#x)"
+          % (BOOT_DRIVE_ADDR, VIDEO_INFO_ADDR))
 
     print("\nВидео и шрифт (BIOS INT 10h):")
     check(vbe_state["mode"] is not None and
