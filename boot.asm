@@ -29,7 +29,7 @@
 [ORG 0x7C00]
 
 STAGE2_START    equ 0x7E00              ; сразу за загрузочным сектором
-STAGE2_SECTORS  equ 2                   ; второй этап занимает 2 сектора
+STAGE2_SECTORS  equ 4                   ; второй этап занимает 4 сектора
 MAX_RETRIES     equ 3
 BOOT_DRIVE_ADDR equ 0x0500              ; номер диска для второго этапа
 

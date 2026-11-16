@@ -1,51 +1,71 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "hal/pmm.h"
+#include "hal/video.h"
+#include "hal/serial.h"
 #include "hal/ata.h"
 #include "fs/fat16.h"
 
-/* Текстовый видеобуфер VGA: 80x25 ячеек, каждая ячейка — 2 байта:
- *   байт символа и байт атрибута (цвет текста и фона). */
-#define VGA_MEM   ((volatile uint8_t *)0xB8000)
-#define VGA_COLS  80
-#define VGA_ROWS  25
-#define VGA_ATTR  0x07          /* светло-серый текст на черном фоне */
+/* Вывод идёт через hal/video.c: в графическом режиме VBE 1024x768
+ * со шрифтом 8x16 это 128x48 символов, в текстовом — 80x25.
+ * Раньше здесь был жёстко зашит буфер 0xB8000: в 80x25 отчёт не
+ * помещался и верх прокручивался. */
+
+#define COLS video_cols()
+#define ROWS video_rows()
+
+/* Раскладка в две колонки.
+ *
+ * Отчёт занимает ~76 строк, а в 1024x768 при шрифте 8x16 строк только
+ * 48 — верх всё равно уезжал бы при прокрутке. Зато ширина экрана 128
+ * символов: две колонки по 64 дают 96 видимых строк, и отчёт виден
+ * целиком. В текстовом режиме 80x25 ширина не позволяет делить экран,
+ * поэтому там остаётся одна колонка и обычная прокрутка.
+ *
+ * page_x — левый столбец текущей колонки (0 или page_w), в символах.
+ * page_w — ширина колонки в символах. */
+#define TWO_COLUMN_MIN_COLS  96
+
+static unsigned int page_x;
+static unsigned int page_w;
+
+static void layout_init(void)
+{
+    if (COLS >= TWO_COLUMN_MIN_COLS) {
+        page_w = COLS / 2;
+        page_x = 0;
+    } else {
+        page_w = COLS;
+        page_x = 0;
+    }
+}
 
 /* Записывает один символ в ячейку (row, col).
  *   Возвращает колонку, в которую нужно писать следующий символ. */
 static unsigned int put_char(unsigned int row, unsigned int col, char c)
 {
-    if (row >= VGA_ROWS || col >= VGA_COLS)
-        return col;                     /* за пределами экрана: пропускаем */
+    if (row >= ROWS || col >= page_w)
+        return col;                     /* за пределами колонки: пропускаем */
 
-    volatile uint8_t *cell = VGA_MEM + (row * VGA_COLS + col) * 2;
-    cell[0] = (uint8_t)c;               /* символ */
-    cell[1] = VGA_ATTR;                 /* атрибут */
+    video_putc(row, page_x + col, c);
+    /* Дублируем в COM1: на экране помещается 48 строк, отчёт длиннее,
+     * и верх уходит при прокрутке. Последовательный порт сохраняет
+     * весь вывод целиком — это видно в эмуляторе и в `qemu -serial stdio`. */
+    serial_putc(c);
     return col + 1;
 }
 
-/* Прокрутка экрана на одну строку вверх: строки 1..24 -> 0..23.
- *   Нужна потому, что карта E820 бывает длиннее экрана. */
+/* Прокрутка экрана на одну строку вверх.
+ *   Нужна, только если отчёт не влез целиком (в текстовом режиме). */
 static void scroll(void)
 {
-    for (unsigned int row = 1; row < VGA_ROWS; row++)
-        for (unsigned int col = 0; col < VGA_COLS; col++) {
-            volatile uint8_t *dst = VGA_MEM + ((row - 1) * VGA_COLS + col) * 2;
-            volatile uint8_t *src = VGA_MEM + (row * VGA_COLS + col) * 2;
-            dst[0] = src[0];
-            dst[1] = src[1];
-        }
-
-    for (unsigned int col = 0; col < VGA_COLS; col++)
-        put_char(VGA_ROWS - 1, col, ' ');
+    video_scroll();
 }
 
 /* Очищает весь экран */
 static void clear_screen(void)
 {
-    for (unsigned int row = 0; row < VGA_ROWS; row++)
-        for (unsigned int col = 0; col < VGA_COLS; col++)
-            put_char(row, col, ' ');
+    video_clear();
 }
 
 /* Выводит строку str, начиная с позиции (row, col).
@@ -94,11 +114,21 @@ static unsigned int cursor_row;
 /* Начать новую строку, прокрутив экран при необходимости */
 static void newline(void)
 {
+    serial_putc('\n');
     cursor_row++;
-    if (cursor_row >= VGA_ROWS) {
-        scroll();
-        cursor_row = VGA_ROWS - 1;
+    if (cursor_row < ROWS)
+        return;
+
+    /* Колонка заполнена: сначала пробуем вторую, прокручиваем только
+     * когда заполнены обе. */
+    if (page_w < COLS && page_x + page_w < COLS) {
+        page_x += page_w;
+        cursor_row = 0;
+        return;
     }
+
+    scroll();
+    cursor_row = ROWS - 1;
 }
 
 /* Вывести строку целиком (с нуля), затем перейти на следующую */
@@ -150,13 +180,30 @@ static void emit_entry(uint32_t index, const e820_entry_t *e)
 
 void kmain(void)
 {
+    serial_init();
     pmm_init();
+
+    int gfx = video_init();
+
     clear_screen();
+    layout_init();
     cursor_row = 0;
 
-    /* ================= 1. Карта памяти от BIOS ================= */
+    /* ================= 0. Видеорежим ================= */
     emit("=== ex-nihilo-OS: physical memory report ===");
-    emit("Memory map source: BIOS INT 15h, AX=E820h");
+    emit(gfx ? "Video: VBE linear framebuffer, 32/16/24 bpp, 8x16 ROM font"
+             : "Video: VGA text mode 80x25 (VBE unavailable)");
+    emit_dec("Screen: ", video_width(), (gfx ? " px wide" : " (text cols)"));
+    emit_dec("Height: ", video_height(), (gfx ? " px" : " (text rows)"));
+    emit_dec("Characters per screen: ", COLS, " columns");
+    emit_dec("Lines per screen:      ", ROWS, "");
+    if (page_w < COLS)
+        emit_dec("Text layout: two columns of ", page_w,
+                 " chars = 2x the lines on screen");
+    emit("");
+
+    /* ================= 1. Карта памяти от BIOS ================= */
+    emit("--- E820 memory map: BIOS INT 15h, AX=E820h ---");
     emit_dec("E820 entries: ", pmm_e820_entries(),
              " (regions reported by firmware)");
     emit_dec("  of them usable (type=1): ", pmm_e820_usable(), "");
@@ -228,7 +275,7 @@ void kmain(void)
 
     /* попытка освободить зарезервированное */
     guard = pmm_free_pages();
-    pmm_free((void *)0xB8000);          /* видеопамять VGA */
+    pmm_free((void *)0xB8000);          /* видеопамять VGA / LFB-окно */
     pmm_free((void *)0x10000);          /* код ядра */
     pmm_free((void *)0xF0000);          /* BIOS ROM */
     emit_dec("After freeing VGA/kernel/ROM:     ", pmm_free_pages(),

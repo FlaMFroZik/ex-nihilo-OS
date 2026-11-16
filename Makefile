@@ -19,11 +19,11 @@ KERNEL_BIN  := $(BUILD)/kernel.bin
 
 # Раскладка образа (в секторах по 512 Б):
 #   0                   — первый этап (boot.asm, ровно 512 Б)
-#   1 .. STAGE2_SECTORS — второй этап (boot2.asm)
+#   1 .. STAGE2_SECTORS — второй этап (boot2.asm), 4 сектора
 #   дальше              — ядро (kernel.bin)
 # Значения обязаны совпадать с константами в boot.asm/boot2.asm;
 # проверка соответствия — targets/layout-check в `make test`.
-STAGE2_SECTORS := 2
+STAGE2_SECTORS := 4
 KERNEL_LBA     := $(shell expr 1 + $(STAGE2_SECTORS))
 IMAGE       := $(BUILD)/os.img
 # FAT16 занимает весь образ после этого сектора. 64 = 1 (boot)
@@ -37,7 +37,7 @@ CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-b
 
 LDFLAGS     := -m elf_i386 -nostdlib -T linker.ld --build-id=none
 
-C_SRCS      := kernel.c fs/fat16.c hal/ata.c
+C_SRCS      := kernel.c fs/fat16.c hal/ata.c hal/video.c hal/serial.c
 ASM_SRCS    := kernel.asm hal/pmm.asm hal/spinlock.asm hal/ata.asm
 FS_C_SRCS   := fs/fat16.c
 
@@ -104,7 +104,10 @@ else
 endif
 
 run: $(IMAGE)
-	qemu-system-i386 -drive format=raw,file=$(IMAGE),if=ide,index=0 -boot c
+	# -vga std: QEMU отдаёт через VBE 1024x768x32, ядро рисует отчёт
+	# в две колонки. -serial stdio: весь вывод ещё и в консоль терминала.
+	qemu-system-i386 -drive format=raw,file=$(IMAGE),if=ide,index=0 -boot c \
+		-vga std -serial stdio
 
 # --- host-тест PMM: настоящие hal/pmm.asm + hal/spinlock.asm ---
 $(BUILD)/tests/start.o: $(TEST_DIR)/start.asm
