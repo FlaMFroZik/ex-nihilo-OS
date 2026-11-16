@@ -25,13 +25,14 @@ STAGE2_SECTORS  equ 2
 BOOT_DRIVE_ADDR equ 0x0500              ; сюда boot.asm кладёт номер диска
 
 KERNEL_START    equ 0x10000             ; физический адрес загрузки ядра
-KERNEL_SECTORS  equ 64                  ; 64 сектора = 32 КиБ
+KERNEL_SECTORS  equ 64                  ; 64 сектора = 32 КиБ (запас;
+                                        ; FAT16 начинается с сектора 64)
 KERNEL_LBA      equ 1 + STAGE2_SECTORS  ; ядро сразу после второго этапа
 MAX_RETRIES     equ 3
 
-SPT             equ 18
-HEADS           equ 2
-TRACK_SECTORS   equ SPT * HEADS
+; Геометрия диска больше НЕ задаётся константами: у дискеты и у
+; жёсткого диска она разная, и угадать её нельзя. Второй этап
+; спрашивает её у BIOS через INT 13h/AH=08h и хранит в spt/heads.
 
 E820_COUNT_ADDR equ 0x0600              ; dword: сколько записей собрано
 E820_BUF_ADDR   equ 0x0608              ; 20 записей по 24 байта = 480 Б
@@ -44,6 +45,7 @@ E820_MAX        equ 20
     mov sp, 0x7C00
     cld
 
+    call detect_geometry                ; геометрия диска от BIOS
     call detect_memory_map
 
     ; Сообщить, сколько регионов нашлось (одна цифра, 10+ -> '9')
@@ -96,23 +98,32 @@ E820_MAX        equ 20
 read_sector:
     mov byte [retries], MAX_RETRIES
 .retry:
-    ; --- LBA → CHS ---
+    ; --- LBA -> CHS по геометрии, полученной от BIOS (INT 13h/AH=08h) ---
+    mov bx, [spt]
+    test bx, bx
+    jz .io_error                        ; геометрию узнать не удалось
+
+    ; AX = heads * spt (делитель), DX:AX = LBA
+    mov ax, [heads]
+    mul word [spt]                      ; DX:AX = heads * spt (влезает в AX)
+    mov bx, ax                          ; BX = секторов на цилиндр
+
     mov ax, [lba]
     xor dx, dx
-    mov bx, TRACK_SECTORS
-    div bx                              ; AX = цилиндр, DX = LBA % 36
+    div bx                              ; AX = цилиндр, DX = LBA % (heads*spt)
     mov [t_cyl], ax
+
     mov ax, dx
     xor dx, dx
-    mov bx, SPT
-    div bx                              ; AX = голова, DX = сектор-1
+    div word [spt]                      ; AX = голова, DX = сектор-1
     mov dh, al                          ; DH = голова
+
     mov cl, dl
-    inc cl                              ; CL = сектор (с 1)
-    mov al, [t_cyl + 1]
+    inc cl                              ; CL = сектор (нумерация с 1)
+    mov al, [t_cyl + 1]                 ; старшие 2 бита цилиндра
     and al, 3
     shl al, 6
-    or cl, al                           ; старшие 2 бита цилиндра → биты 6-7 CL
+    or cl, al                           ; ...в биты 6-7 регистра CL
     mov ch, [t_cyl]                     ; CH = младшие 8 бит цилиндра
 
     mov dl, [BOOT_DRIVE_ADDR]
@@ -129,10 +140,47 @@ read_sector:
     dec byte [retries]
     jnz .retry
 
+.io_error:
     mov si, msg_disk_err
     call print_string
     jmp $
 .ok:
+    ret
+
+; ============================================================
+; detect_geometry — узнать у BIOS число секторов на дорожку и
+; головок (INT 13h/AH=08h).
+;
+; Без этого LBA→CHS считать нельзя: у дискеты 18/2, у маленького
+; IDE-диска в QEMU — 63/16, и ошибка в геометрии означает чтение
+; совсем других секторов (в лучшем случае — "Disk read error!").
+;
+; Результат: spt и heads в памяти. При ошибке BIOS оставляем
+; значения по умолчанию (1 сектор, 1 головка) — тогда read_sector
+; честно упадёт в сообщение об ошибке, а не прочитает мусор.
+; ============================================================
+detect_geometry:
+    pusha
+
+    mov word [spt], 0
+    mov word [heads], 0
+
+    mov ah, 0x08
+    mov dl, [BOOT_DRIVE_ADDR]
+    xor di, di                          ; старые BIOS: DL = число дисков
+    int 0x13
+    jc .done
+
+    ; CL[5:0] — максимум секторов, DH — максимум головок
+    mov al, cl
+    and ax, 0x3F
+    mov [spt], ax
+    movzx ax, dh
+    inc ax                              ; DH — номер последней головки
+    mov [heads], ax
+
+.done:
+    popa
     ret
 
 ; ============================================================
@@ -245,6 +293,8 @@ dest_seg:    dw 0
 retries:     db 0
 lba:         dw 0
 t_cyl:       dw 0
+spt:         dw 0
+heads:       dw 0
 
 e820_count:  dw 0
 e820_next:   dd 0

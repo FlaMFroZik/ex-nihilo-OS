@@ -1,8 +1,9 @@
 # Makefile — сборка ex-nihilo-OS
 #
-#   make            — собрать build/os.img (образ дискеты: boot + kernel)
-#   make run        — запустить образ в QEMU
-#   make test       — прогнать host-тесты PMM (настоящий hal/pmm.asm)
+#   make            — собрать build/os.img (образ HDD: boot + kernel + FAT16)
+#   make run        — запустить образ в QEMU (как жёсткий диск)
+#   make test       — host-тесты PMM и FAT16 (настоящие hal/pmm.asm, fs/fat16.c)
+#   make boottest   — эмуляционная проверка загрузчика (нужен unicorn)
 #   make clean      — удалить build/
 #
 # Требуется: nasm, gcc (с поддержкой -m32), binutils-ld, для `make run` — qemu-system-i386.
@@ -25,6 +26,10 @@ KERNEL_BIN  := $(BUILD)/kernel.bin
 STAGE2_SECTORS := 2
 KERNEL_LBA     := $(shell expr 1 + $(STAGE2_SECTORS))
 IMAGE       := $(BUILD)/os.img
+# FAT16 занимает весь образ после этого сектора. 64 = 1 (boot)
+# + 2 (boot2) + 61 сектор запаса под ядро (ядро сейчас ~32 сектора).
+# Должно совпадать с FAT_BASE_LBA в hal/ata.h и fs/fat16.h.
+FAT_BASE_LBA := 64
 
 CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-builtin \
                -fno-asynchronous-unwind-tables -nostdlib -std=gnu11 -O2 \
@@ -32,8 +37,9 @@ CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-b
 
 LDFLAGS     := -m elf_i386 -nostdlib -T linker.ld --build-id=none
 
-C_SRCS      := kernel.c
-ASM_SRCS    := kernel.asm hal/pmm.asm hal/spinlock.asm
+C_SRCS      := kernel.c fs/fat16.c hal/ata.c
+ASM_SRCS    := kernel.asm hal/pmm.asm hal/spinlock.asm hal/ata.asm
+FS_C_SRCS   := fs/fat16.c
 
 # .c и .asm могут иметь одинаковое имя (kernel.c / kernel.asm),
 # поэтому объектники раскладываем по разным каталогам.
@@ -42,14 +48,17 @@ ASM_OBJS    := $(patsubst %.asm,$(BUILD)/asm/%.o,$(ASM_SRCS))
 
 TEST_DIR    := tests
 TEST_BIN    := $(BUILD)/pmm_test
+FAT_TEST    := $(BUILD)/fat_test
 BOOTEMU     := tools/bootemu.py
+MKFATIMG    := tools/mkfatimg.py
 
 # unicorn нужен только для эмуляционной проверки загрузчика.
 # Если его нет — цель пропускается с предупреждением, а не падает.
 PYTHON      ?= python3
 HAVE_UNICORN := $(shell $(PYTHON) -c "import unicorn" 2>/dev/null && echo 1)
+HAVE_PYFATFS := $(shell $(PYTHON) -c "import pyfatfs" 2>/dev/null && echo 1)
 
-.PHONY: all run test boottest clean
+.PHONY: all run test fattest boottest layout-check clean
 
 all: $(IMAGE)
 
@@ -79,16 +88,23 @@ $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 	  (echo "error: kernel.bin exceeds the 32 KiB the bootloader loads" && rm -f $@ && exit 1)
 	@echo "built $@ (`stat -c%s $@` bytes)"
 
-# --- образ дискеты 1.44 МБ ---
-$(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN)
-	dd if=/dev/zero of=$@ bs=512 count=2880 status=none
-	dd if=$(BOOT_BIN)   of=$@ bs=512 conv=notrunc status=none
-	dd if=$(BOOT2_BIN)  of=$@ bs=512 seek=1 conv=notrunc status=none
-	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=$(KERNEL_LBA) conv=notrunc status=none
+# --- образ HDD 16 МиБ: boot + boot2 + kernel + FAT16 ---
+#
+# Образ именно жёсткого диска, а не дискеты: FAT16 требует не меньше
+# 4085 кластеров (иначе это FAT12 по спецификации), а на 1.44 МБ их
+# максимум ~2880. Кроме того, ядру нужен драйвер диска в защищённом
+# режиме — ATA PIO на HDD проще и надёжнее, чем FDC на дискете.
+$(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(MKFATIMG)
+ifdef HAVE_PYFATFS
+	$(PYTHON) $(MKFATIMG) $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $@
 	@echo "built $@ (`stat -c%s $@` bytes)"
+else
+	@echo "error: для сборки образа нужен pyfatfs (pip install pyfatfs)"
+	@false
+endif
 
 run: $(IMAGE)
-	qemu-system-i386 -drive format=raw,file=$(IMAGE),if=floppy -boot a
+	qemu-system-i386 -drive format=raw,file=$(IMAGE),if=ide,index=0 -boot c
 
 # --- host-тест PMM: настоящие hal/pmm.asm + hal/spinlock.asm ---
 $(BUILD)/tests/start.o: $(TEST_DIR)/start.asm
@@ -118,7 +134,7 @@ $(TEST_BIN): $(BUILD)/tests/start.o $(BUILD)/tests/pmm_test.o \
              $(BUILD)/tests/pmm_under_test.o $(BUILD)/tests/spinlock.o $(TEST_DIR)/test.ld
 	$(LD) -m elf_i386 -nostdlib -T $(TEST_DIR)/test.ld -o $@ $(filter %.o,$^)
 
-test: $(TEST_BIN)
+test: $(TEST_BIN) fattest
 	./$(TEST_BIN)
 
 # --- проверка раскладки образа (совпадение констант Makefile и asm) ---
@@ -135,13 +151,43 @@ layout-check: $(IMAGE)
 	  (echo "error: ядро в образе не на месте KERNEL_LBA=$(KERNEL_LBA)" && exit 1)
 	@echo "layout ok: boot=сектор 0, boot2=1..$(STAGE2_SECTORS), kernel=$(KERNEL_LBA).."
 
-# --- эмуляционная проверка загрузчика (нужен unicorn) ---
+# --- эмуляционная проверка загрузчика И ядра (нужен unicorn) ---
+#
+# Единственный тест, который проходит весь путь: BIOS → реальный режим
+# → защищённый режим → ATA PIO → FAT16. Ловит то, что не видно ни
+# host-тестам, ни сборке: неверную геометрию CHS, неверные порты ATA,
+# испорченные аргументы вызовов.
 boottest: $(IMAGE) $(KERNEL_BIN)
 ifdef HAVE_UNICORN
 	$(PYTHON) $(BOOTEMU) $(IMAGE) $(KERNEL_BIN)
 else
 	@echo "boottest: пропущено — не установлен unicorn (pip install unicorn)"
 endif
+
+# --- host-тест драйвера FAT16 ---
+#
+# Тест линкуется с настоящим fs/fat16.c и работает по образу, который
+# собирает mkfatimg.py: структуру ФС создаёт независимая реализация
+# (pyfatfs), поэтому драйвер проверяется против чужого кода, а не
+# против самого себя.
+$(BUILD)/tests/fat_start.o: $(TEST_DIR)/fat_start.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf32 $< -o $@
+
+$(BUILD)/tests/fat_test.o: $(TEST_DIR)/fat_test.c fs/fat16.h fs/blockdev.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/fat16_under_test.o: fs/fat16.c fs/fat16.h fs/blockdev.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c fs/fat16.c -o $@
+
+$(FAT_TEST): $(BUILD)/tests/fat_start.o $(BUILD)/tests/fat_test.o \
+             $(BUILD)/tests/fat16_under_test.o $(TEST_DIR)/test.ld
+	$(LD) -m elf_i386 -nostdlib -T $(TEST_DIR)/test.ld -o $@ $(filter %.o,$^)
+
+fattest: $(FAT_TEST) $(IMAGE)
+	./$(FAT_TEST) $(IMAGE)
 
 clean:
 	rm -rf $(BUILD)

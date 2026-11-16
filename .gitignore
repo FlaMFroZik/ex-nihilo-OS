@@ -9,3 +9,7 @@ build/
 # редакторы / ОС
 *.swp
 .DS_Store
+
+# python
+__pycache__/
+*.pyc

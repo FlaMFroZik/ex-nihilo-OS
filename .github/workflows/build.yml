@@ -15,23 +15,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm gcc-multilib python3-pip
-          # unicorn нужен для эмуляционной проверки загрузчика
-          pip install --break-system-packages unicorn
+          # unicorn — эмуляция загрузчика и ядра,
+          # pyfatfs — независимая реализация FAT16 для сборки образа
+          pip install --break-system-packages unicorn pyfatfs
 
-      - name: Build kernel image
+      - name: Build image (boot + kernel + FAT16)
         run: make all
 
-      - name: Run PMM host tests
+      - name: Run host tests (PMM + FAT16)
         run: make test
 
       - name: Check image layout (boot / boot2 / kernel offsets)
         run: make layout-check
 
-      - name: Emulate the bootloader end to end
+      - name: Emulate bootloader and kernel end to end
         run: make boottest
 
       - name: Show image layout
         run: |
           ls -l build/os.img build/boot.bin build/boot2.bin build/kernel.bin
-          # загрузчик читает не больше 32 КиБ ядра
+          # загрузчик читает 64 сектора = 32 КиБ ядра
           test "$(stat -c%s build/kernel.bin)" -le 32768
+          # FAT16 обязана начинаться не раньше сектора 64
+          test "$(stat -c%s build/kernel.bin)" -le $((61 * 512))
