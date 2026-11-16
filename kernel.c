@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "hal/pmm.h"
+#include "hal/ata.h"
+#include "fs/fat16.h"
 
 /* Текстовый видеобуфер VGA: 80x25 ячеек, каждая ячейка — 2 байта:
  *   байт символа и байт атрибута (цвет текста и фона). */
@@ -233,7 +235,146 @@ void kmain(void)
              (pmm_free_pages() == guard) ? "  [ok, protected]" : "  [BUG]");
     emit("");
 
-    /* ================= 5. Итог ================= */
+    /* ================= 5. Файловая система FAT16 ================= */
+    emit("=== FAT16 filesystem ===");
+
+    static blockdev_t disk;
+    static fat16_volume_t vol;
+
+    if (ata_blockdev(&disk) != 0) {
+        emit("ATA: disk not found - filesystem unavailable.");
+        emit("(boot the image as a hard disk, not as a floppy)");
+    } else {
+        emit_dec("ATA: sectors on disk:              ", disk.sectors, "");
+        emit_dec("ATA: FAT16 starts at sector:       ", EXNIHILO_FAT_LBA, "");
+
+        int rc = fat16_mount(&disk, EXNIHILO_FAT_LBA, &vol);
+
+        if (rc != FAT16_OK) {
+            emit_dec("mount failed, error ", rc, "");
+        } else {
+            emit_dec("Clusters total:                   ", fat16_total_clusters(&vol), "");
+            emit_dec("Clusters free:                    ", fat16_free_clusters(&vol), "");
+            emit_dec("Cluster size, bytes:              ", vol.cluster_bytes, "");
+
+            /* --- листинг корневого каталога --- */
+            emit("--- directory / ---");
+
+            fat16_dirent_t de;
+
+            for (uint32_t i = 0; fat16_readdir(&vol, "/", i, &de) == 1; i++) {
+                unsigned int col = out(cursor_row, 0, "  ");
+
+                col = out(cursor_row, col, de.name);
+
+                for (unsigned int pad = 12; pad > 0 && col < 12 + 4; pad--)
+                    col = put_char(cursor_row, col, ' ');
+
+                col = out(cursor_row, col, (de.attr & FAT16_ATTR_DIRECTORY)
+                                            ? "<DIR>   " : "        ");
+                col = out_dec(cursor_row, col, de.size);
+                out(cursor_row, col, " bytes");
+                newline();
+            }
+
+            /* --- чтение файла через драйвер --- */
+            emit("--- read /HELLO.TXT ---");
+
+            fat16_file_t f;
+
+            rc = fat16_open(&vol, "/HELLO.TXT", FAT16_O_RDONLY, &f);
+
+            if (rc != FAT16_OK) {
+                emit_dec("open failed, error ", rc, "");
+            } else {
+                static char text[256];
+                int n = fat16_read(&vol, &f, text, sizeof(text) - 1);
+
+                fat16_close(&vol, &f);
+
+                if (n < 0) {
+                    emit_dec("read failed, error ", n, "");
+                } else {
+                    text[n] = '\0';
+                    emit_dec("read bytes: ", n, "");
+                    emit("content:");
+                    out(cursor_row, 0, "  ");
+                    out(cursor_row, 2, text);
+                    newline();
+                }
+            }
+
+            /* --- запись: проверяем, что диск действительно пишется --- */
+            emit("--- write test: /WRITE.TXT ---");
+
+            const char *payload = "written by ex-nihilo-OS\n";
+            uint32_t payload_len = 0;
+
+            while (payload[payload_len])
+                payload_len++;
+
+            uint32_t free_before = fat16_free_clusters(&vol);
+
+            rc = fat16_open(&vol, "/WRITE.TXT",
+                            FAT16_O_WRONLY | FAT16_O_CREAT | FAT16_O_TRUNC, &f);
+
+            if (rc != FAT16_OK) {
+                emit_dec("create failed, error ", rc, "");
+            } else {
+                int w = fat16_write(&vol, &f, payload, payload_len);
+                int cr = fat16_close(&vol, &f);
+
+                emit_dec("bytes written: ", w,
+                         (w == (int)payload_len) ? "  [ok]" : "  [BUG]");
+                emit_dec("close: ", cr, (cr == FAT16_OK) ? "  [ok]" : "  [BUG]");
+
+                /* перечитать записанное */
+                rc = fat16_open(&vol, "/WRITE.TXT", FAT16_O_RDONLY, &f);
+
+                if (rc == FAT16_OK) {
+                    static char back[256];
+                    int n = fat16_read(&vol, &f, back, sizeof(back) - 1);
+
+                    fat16_close(&vol, &f);
+
+                    int same = (n == (int)payload_len);
+
+                    for (int i = 0; i < n && same; i++)
+                        if (back[i] != payload[i])
+                            same = 0;
+
+                    emit_dec("re-read bytes: ", n, same ? "  [ok, identical]"
+                                                       : "  [BUG]");
+                }
+
+                emit_dec("free clusters: before ", free_before, "");
+                emit_dec("              after  ", fat16_free_clusters(&vol), "");
+            }
+
+            /* --- удаление: освобождает кластеры --- */
+            emit("--- unlink /WRITE.TXT ---");
+
+            rc = fat16_unlink(&vol, "/WRITE.TXT");
+
+            emit_dec("unlink: ", rc, (rc == FAT16_OK) ? "  [ok]" : "  [BUG]");
+
+            if (rc == FAT16_OK)
+                emit_dec("free clusters after unlink:       ",
+                         fat16_free_clusters(&vol), "");
+
+            /* --- сколько секторов реально прошло через ATA --- */
+            emit_dec("ATA sectors read:                 ", ata_read_count(), "");
+            emit_dec("ATA sectors written:              ", ata_write_count(), "");
+
+            /* проверка, что удаление действительно было: файла нет */
+            emit_dec("exists(/WRITE.TXT) after unlink:  ",
+                     (uint32_t)fat16_exists(&vol, "/WRITE.TXT"),
+                     fat16_exists(&vol, "/WRITE.TXT") ? "  [BUG]" : "  [ok]");
+        }
+    }
+    emit("");
+
+    /* ================= 6. Итог ================= */
     emit("--- final state ---");
     emit_dec("Free pages remaining:             ", pmm_free_pages(), "");
     emit_dec("Free RAM remaining, KiB:          ", pmm_free_pages() * 4, "");
