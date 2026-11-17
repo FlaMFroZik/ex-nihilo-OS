@@ -248,6 +248,61 @@ fat16_rmdir / fat16_readdir / fat16_rename / fat16_exists
 пропускаются при разборе, но не создаются), без фрагментации и без
 журнала; гарантий при выключении питания посреди записи нет.
 
+## API ядра: префикс `k` и syscall'ы Ring 3 → Ring 0
+
+Поверх драйверов (`fat16_*`, `pmm_*` — их имена не тронуты, на них
+завязаны host-тесты) лежит API самого ядра, где у каждой ранее
+сделанной функции в начале стоит префикс `k` (`kernel/kapi.h`):
+`kopen`, `kclose`, `kread`, `kwrite`, `kseek`, `kunlink`, `kreaddir`,
+`kexists`, `kmount`, `kpmm_alloc`, `kpmm_free`, `kprint`. Том и таблица
+fd спрятаны внутри Ring 0: `kopen()` возвращает fd, как `open()`.
+
+Код Ring 3 вызывать `kopen()` не может — для него есть syscall
+`int 0x80` (`kernel/syscall.h`, `kernel/syscall.asm`):
+
+1. Ring 3: номер в `EAX` (`SYS_KOPEN=1`, …), аргументы в
+   `EBX, ECX, EDX, ESI, EDI`, затем `int 0x80`;
+2. вектор `0x80` в IDT — interrupt gate с `DPL=3`; процессор сам
+   берёт стек Ring 0 из `TSS.ESP0` и сохраняет контекст Ring 3;
+3. Ring 0: `syscall_dispatch()` вызывает настоящую k-функцию,
+   например `kopen(path, flags)`, результат пишется в сохранённый
+   `EAX`;
+4. `iret` возвращает управление в Ring 3 на инструкцию после
+   `int 0x80` — вернулась функция ядра, вернулся и syscall.
+   `SYS_KEXIT` — исключение: он восстанавливает стек ядра, и
+   `enter_usermode()` возвращает код завершения.
+
+Своя GDT (kernel DPL=0, user DPL=3, TSS) и IDT ставятся
+`syscall_cpu_init()`. Демо в конце `kmain`: `user_main`
+(`kernel/user.c`) исполняется в Ring 3, читает `/HELLO.TXT` через
+`SYS_KOPEN/SYS_KREAD/SYS_KCLOSE`; ядро печатает CPL=3, fd и число
+байт с пометками `[ok]`.
+
+### execve и ELF-бинарники
+
+`kexecve(path, argv, envp)` (syscall `SYS_KEXECVE=10`,
+`kernel/exec.c`) — поддержка настоящих бинарников:
+
+* формат — **ELF32** (little-endian, i386, `ET_EXEC`); проверяются
+  магия, класс, машина, заголовки программ;
+* сегменты `PT_LOAD` копируются по виртуальным адресам (модель
+  плоская, `vaddr` == физический), хвост `memsz > filesz`
+  обнуляется (bss); сегменты ниже `0x100000` и за концом RAM
+  отвергаются (`-ENOEXEC`);
+* на новом стеке строится кадр `[argc][argv…][NULL][envp…][NULL]`,
+  строки — выше; `_start` (`programs/start.asm`) достаёт argc/argv
+  и зовёт `prog_main()`;
+* при успехе `kexecve` **не возвращается** (`exec_jump` делает
+  `iret` на `e_entry` в Ring 3), при ошибке возвращает код — как
+  POSIX. Файл до 64 КиБ читается постранично из PMM.
+
+Программы лежат в `programs/` (`user1.c`, `user2.c`), собираются
+обычным `ld` в ELF по `programs/user.ld` (адрес `0x400000`) и
+попадают в образ как `USER1.ELF`/`USER2.ELF`. Демо-цепочка:
+`user_main` → `execve("/USER1.ELF")` → USER1 `execve("/USER2.ELF",
+{"USER2.ELF", "passed-by-user1"})` → USER2 печатает `argv[1]` и
+выходит с кодом 42, который и проверяет `kmain`.
+
 ## Тесты
 
 ```
@@ -265,4 +320,12 @@ make boottest      # эмуляция: загрузчик + ядро + ATA + FAT
 * `ata_wait_ready` разбирал регистр состояния из `AL`, куда вызывающий
   код только что положил команду `0xEC`, — диск «зависал» занятым;
 * аргументы `ata_read_sector` читались из стека со смещением на слово
-  больше нужного, потому что функция была без прототипа.
+  больше нужного, потому что функция была без прототипа;
+* `ata_init` ставил результат в `EAX` до `popad`, и тот его
+  восстанавливал — второй `kmount()` получал мусор вместо «диск есть»;
+* обработчик `int 0x80` загружал сегменты через `AX`, затирая номер
+  syscall'а в `EAX`, — теперь сначала делается `pushad`.
+
+unicorn не обходит IDT и не повышает CPL через `reg_write`, поэтому
+доставку `int 0x80` в `tools/bootemu.py` эмулирует хук — ровно по
+шагам настоящего interrupt gate (TSS.ESP0, кадр, `iret`).

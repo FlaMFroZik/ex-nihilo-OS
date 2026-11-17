@@ -207,13 +207,13 @@ ata_init:
     jb .read_words
 
     mov dword [ata_present], 1
-    mov eax, 1
     popad
+    mov eax, 1                  ; ПОСЛЕ popad: иначе он вернёт входной EAX
     ret
 
 .no_disk:
-    xor eax, eax
     popad
+    xor eax, eax                ; аналогично: 0 ставим после popad
     ret
 
 ; ------------------------------------------------------------

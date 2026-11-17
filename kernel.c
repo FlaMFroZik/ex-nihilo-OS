@@ -5,6 +5,10 @@
 #include "hal/serial.h"
 #include "hal/ata.h"
 #include "fs/fat16.h"
+#include "kernel/kapi.h"
+#include "kernel/syscall.h"
+#include "kernel/user.h"
+#include "kernel/exec.h"
 
 /* Вывод идёт через hal/video.c: в графическом режиме VBE 1024x768
  * со шрифтом 8x16 это 128x48 символов, в текстовом — 80x25.
@@ -176,6 +180,21 @@ static void emit_entry(uint32_t index, const e820_entry_t *e)
     out_dec(cursor_row, col, (uintptr_t)(e->length / PAGE_SIZE));
 
     newline();
+}
+
+/* Обработчик вывода для kprint(): Ring 3 печатает через SYS_KPRINT,
+ * а рисует уже Ring 0 — этой функцией, в общую раскладку экрана. */
+static unsigned int print_col;
+static void syscall_print(const char *str)
+{
+    for (; *str; str++) {
+        if (*str == '\n') {
+            print_col = 0;
+            newline();
+        } else {
+            print_col = put_char(cursor_row, print_col, *str);
+        }
+    }
 }
 
 void kmain(void)
@@ -421,7 +440,54 @@ void kmain(void)
     }
     emit("");
 
-    /* ================= 6. Итог ================= */
+    /* ================= 6. Ring 3 -> syscall -> Ring 0 ================= */
+    emit("=== syscall demo: Ring3 --int 0x80--> Ring0 kopen/kread ===");
+    emit("=== execve demo: user -> USER1.ELF -> USER2.ELF (ELF32) ===");
+
+    int mrc = kmount();
+    if (mrc != FAT16_OK) {
+        emit_dec("kmount failed, rc ", (uintptr_t)(int32_t)mrc, " - syscall demo skipped.");
+    } else {
+        syscall_cpu_init();             /* GDT(user/TSS) + IDT[0x80] */
+        kprint_register(syscall_print);
+
+        void *ustack = kpmm_alloc();    /* страница под стек Ring 3 */
+        if (ustack == NULL) {
+            emit("no page for user stack - demo skipped.");
+        } else {
+            int code = enter_usermode(user_main,
+                                      (char *)ustack + PAGE_SIZE);
+            kpmm_free(ustack);
+            kexec_cleanup();        /* страница стека последнего exec'а */
+
+            /* Мы снова в Ring 0: enter_usermode вернулся по SYS_KEXIT.
+             * Если execve удался, цепочка USER1.ELF -> USER2.ELF
+             * закончилась кодом 42; если нет — user_main вышел с 7. */
+            int expected = user_demo_state.execve_attempted ? 42 : 7;
+            emit_dec("user exit code (SYS_KEXIT):       ", code,
+                     (code == expected) ? "  [ok]" : "  [BUG]");
+            emit_dec("execve chain to USER2.ELF:        ",
+                     user_demo_state.execve_attempted,
+                     (user_demo_state.execve_attempted && code == 42)
+                         ? "  [ok, exit 42]" : "  [BUG]");
+            emit_dec("CPL seen by user code (CS & 3):   ", user_demo_state.cpl,
+                     (user_demo_state.cpl == 3) ? "  [ok, Ring 3]" : "  [BUG]");
+            emit_dec("kopen(\"/HELLO.TXT\") -> fd:        ", user_demo_state.open_rc,
+                     (user_demo_state.open_rc >= 0) ? "  [ok]" : "  [BUG]");
+            emit_dec("kread() -> bytes:                 ", user_demo_state.read_rc,
+                     (user_demo_state.read_rc > 0) ? "  [ok]" : "  [BUG]");
+            emit_dec("kclose() -> rc:                   ", user_demo_state.close_rc,
+                     (user_demo_state.close_rc == 0) ? "  [ok]" : "  [BUG]");
+            if (user_demo_state.read_rc > 0) {
+                out(cursor_row, 0, "  file content via syscall: ");
+                out(cursor_row, 28, user_demo_state.text);
+                newline();
+            }
+        }
+    }
+    emit("");
+
+    /* ================= 7. Итог ================= */
     emit("--- final state ---");
     emit_dec("Free pages remaining:             ", pmm_free_pages(), "");
     emit_dec("Free RAM remaining, KiB:          ", pmm_free_pages() * 4, "");
