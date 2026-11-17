@@ -14,10 +14,10 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm gcc-multilib python3-pip
+          sudo apt-get install -y nasm gcc-multilib python3-pip mtools
           # unicorn — эмуляция загрузчика и ядра,
-          # pyfatfs — независимая реализация FAT16 для сборки образа
-          pip install --break-system-packages unicorn pyfatfs
+          # mtools — независимая реализация FAT16 для сборки образа
+          pip install --break-system-packages unicorn
 
       - name: Build image (boot + kernel + FAT16)
         run: make all
