@@ -41,7 +41,9 @@ try:
         UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_CS, UC_X86_REG_CR0,
         UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EDI, UC_X86_REG_ESI,
         UC_X86_REG_DS, UC_X86_REG_SS, UC_X86_REG_FS, UC_X86_REG_GS,
-        UC_X86_REG_GDTR, UC_X86_REG_CX, UC_X86_REG_BP,
+        UC_X86_REG_GDTR, UC_X86_REG_IDTR, UC_X86_REG_TR,
+        UC_X86_REG_SP,
+        UC_X86_REG_CX, UC_X86_REG_BP,
         UC_X86_INS_IN, UC_X86_INS_OUT,
     )
 except ImportError:
@@ -560,6 +562,77 @@ def main():
     mu2.hook_add(UC_HOOK_INSN, on_in2, None, 1, 0, UC_X86_INS_IN)
     mu2.hook_add(UC_HOOK_INSN, on_out2, None, 1, 0, UC_X86_INS_OUT)
 
+    # --- доставка int 0x80 (syscall Ring3 -> Ring0) ---
+    #
+    # unicorn IDT не обходит: `int` просто вызывает UC_HOOK_INTR и
+    # пропускается. На настоящем железе interrupt gate сам делает:
+    # стек Ring0 из TSS.ESP0, кадр SS/ESP/EFLAGS/CS/EIP на него,
+    # CS:EIP — из IDT. Делаем ровно это вручную. Два ограничения
+    # unicorn обходятся здесь же, и только здесь:
+    #   * reg_write(CS/SS) с повышением CPL unicorn запрещает, поэтому
+    #     CS обработчика не трогаем (модель плоская — исполнение от
+    #     этого не меняется), а дескриптору данных ядра в КОПИИ GDT
+    #     эмулятора поднимаем DPL, чтобы `mov ds, 0x10` из CPL=3 не
+    #     дал #GP. На реальную GDT ядра это не влияет.
+    #   * финальный `iret` обработчика при равном CPL не снял бы
+    #     ESP/SS со стека, поэтому перехватываем его UC_HOOK_CODE и
+    #     восстанавливаем контекст Ring3 сами, как сделал бы CPU.
+    syscall_state = {"active": False}
+
+    def _push32(val):
+        esp = mu2.reg_read(UC_X86_REG_ESP) - 4
+        mu2.reg_write(UC_X86_REG_ESP, esp)
+        mu2.mem_write(esp, struct.pack("<I", val & 0xFFFFFFFF))
+
+    def on_intr2(u, intno, _):
+        if intno != 0x80:
+            return
+        idtr = u.reg_read(UC_X86_REG_IDTR)
+        gdtr = u.reg_read(UC_X86_REG_GDTR)
+        tr = u.reg_read(UC_X86_REG_TR)
+        ent = bytes(u.mem_read(idtr[1] + 0x80 * 8, 8))
+        handler = struct.unpack("<H", ent[0:2])[0] | \
+            (struct.unpack("<H", ent[6:8])[0] << 16)
+        desc = bytes(u.mem_read(gdtr[1] + (tr[0] & ~7), 8))
+        tss_base = struct.unpack("<H", desc[2:4])[0] | \
+            (desc[4] << 16) | (desc[7] << 24)
+        esp0 = struct.unpack("<I", bytes(u.mem_read(tss_base + 4, 4)))[0]
+
+        acc = gdtr[1] + 16 + 5      # access-байт дескриптора данных ядра
+        u.mem_write(acc, bytes([bytes(u.mem_read(acc, 1))[0] | 0x60]))
+
+        user_ss = u.reg_read(UC_X86_REG_SS)
+        user_esp = u.reg_read(UC_X86_REG_ESP)
+        user_cs = u.reg_read(UC_X86_REG_CS)
+        user_eip = u.reg_read(UC_X86_REG_EIP)   # unicorn: уже след. insn
+        eflags = u.reg_read(UC_X86_REG_EFLAGS)
+        u.reg_write(UC_X86_REG_ESP, esp0)
+        _push32(user_ss)
+        _push32(user_esp)
+        _push32(eflags & ~0x200)                # interrupt gate гасит IF
+        _push32(user_cs)
+        _push32(user_eip)
+        syscall_state["active"] = True
+        u.reg_write(UC_X86_REG_EIP, handler)
+
+    def on_code_syscall(u, addr, size, _):
+        if not syscall_state["active"]:
+            return
+        if bytes(u.mem_read(addr, 1))[0] != 0xCF:   # не iret обработчика
+            return
+        esp = u.reg_read(UC_X86_REG_ESP)
+        eip, cs, eflags, user_esp, user_ss = struct.unpack(
+            "<5I", bytes(u.mem_read(esp, 20)))
+        syscall_state["active"] = False
+        u.reg_write(UC_X86_REG_SS, user_ss)
+        u.reg_write(UC_X86_REG_ESP, user_esp)
+        u.reg_write(UC_X86_REG_CS, cs)
+        u.reg_write(UC_X86_REG_EFLAGS, eflags)
+        u.reg_write(UC_X86_REG_EIP, eip)
+
+    mu2.hook_add(UC_HOOK_INTR, on_intr2)
+    mu2.hook_add(UC_HOOK_CODE, on_code_syscall)
+
     # Конец работы ядра — hlt-цикл. Ловим код hlt (0xF4) хуком кода:
     # на этот адрес ядро возвращается бесконечно.
     hlt_state = {"addr": None, "hits": 0}
@@ -679,6 +752,16 @@ def main():
     check("not found" not in text2 and "unavailable" not in text2,
           "ошибок монтирования нет")
     check(has(r"Free\s+pages\s+remaining"), "отчёт PMM дошёл до конца")
+    print("\nSyscall (Ring3 --int 0x80--> Ring0):")
+    check(has(r"CPL\s+seen\s+by\s+user.*3\s+\[ok"), "юзерский код реально в Ring 3 (CPL=3)")
+    check(has(r"kopen\(\"/HELLO\.TXT\"\)\s*->\s*fd:.*\[ok\]"), "syscall SYS_KOPEN вызвал kopen() в Ring 0")
+    check(has(r"kread\(\)\s*->\s*bytes:\s+12\s+\[ok\]"), "syscall SYS_KREAD прочитал HELLO.TXT (12 байт)")
+    check(has(r"kclose\(\)\s*->\s*rc:\s+0\s+\[ok\]"), "syscall SYS_KCLOSE вернул 0")
+    check(has(r"user\s+exit\s+code.*42\s+\[ok\]"), "SYS_KEXIT вернул управление и код 42 в Ring 0")
+    print("\nExecve / ELF:")
+    check(has(r"USER1\.ELF:\s+hello\s+from\s+ELF"), "USER1.ELF загружен с диска и исполняется")
+    check(has(r"USER2\.ELF:\s+argv\[1\]=passed-by-user1"), "argv пережил два execve подряд")
+    check(has(r"execve\s+chain\s+to\s+USER2\.ELF:.*\[ok"), "цепочка execve USER1.ELF -> USER2.ELF завершилась кодом 42")
     check(disk.writes > 0, "запись действительно дошла до диска")
 
     # 5) образ изменился ровно в тех секторах, куда писал драйвер

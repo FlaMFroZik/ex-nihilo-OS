@@ -14,7 +14,11 @@ pyfatfs. Скрипт лишь раскладывает секторы и кла
 самого себя.
 
 Использование:
-    python3 tools/mkfatimg.py <boot.bin> <boot2.bin> <kernel.bin> <out.img>
+    python3 tools/mkfatimg.py <boot.bin> <boot2.bin> <kernel.bin> <out.img> \
+        [user1.elf user2.elf]
+
+ELF-программы (если переданы) попадут в корень ФС как USER1.ELF и
+USER2.ELF — их в рантайме запускает kexecve() из ядра.
 """
 
 import sys
@@ -148,6 +152,7 @@ def main():
         sys.exit(__doc__.strip().splitlines()[-1])
 
     boot_path, boot2_path, kernel_path, out_path = sys.argv[1:5]
+    user_elfs = sys.argv[5:]            # [user1.elf, user2.elf] -> USERn.ELF
     boot = open(boot_path, "rb").read()
     boot2 = open(boot2_path, "rb").read()
     kernel = open(kernel_path, "rb").read()
@@ -190,6 +195,10 @@ def main():
     # заглушками нужной длины, а сами данные кладём в кластеры напрямую.
     seeded = seeded_files()
     seeded["DIR1/NESTED.TXT"] = b"nested\n"
+    for i, elf_path in enumerate(user_elfs, 1):
+        # Байты ELF кладём как есть: write_data_clusters() запишет их
+        # в кластеры напрямую, в обход текстовых ограничений pyfatfs.
+        seeded["USER%d.ELF" % i] = open(elf_path, "rb").read()
 
     fs = PyFatFS(tmp_path)
     for name, data in seeded.items():

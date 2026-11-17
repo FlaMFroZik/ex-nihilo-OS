@@ -37,8 +37,9 @@ CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-b
 
 LDFLAGS     := -m elf_i386 -nostdlib -T linker.ld --build-id=none
 
-C_SRCS      := kernel.c fs/fat16.c hal/ata.c hal/video.c hal/serial.c
-ASM_SRCS    := kernel.asm hal/pmm.asm hal/spinlock.asm hal/ata.asm
+C_SRCS      := kernel.c kernel/kapi.c kernel/syscall.c kernel/user.c kernel/exec.c \
+               fs/fat16.c hal/ata.c hal/video.c hal/serial.c
+ASM_SRCS    := kernel.asm kernel/syscall.asm hal/pmm.asm hal/spinlock.asm hal/ata.asm
 FS_C_SRCS   := fs/fat16.c
 
 # .c и .asm могут иметь одинаковое имя (kernel.c / kernel.asm),
@@ -81,6 +82,16 @@ $(BUILD)/c/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# --- пользовательские ELF-программы (programs/): отдельные бинарники ---
+# Это НЕ плоский образ: файл обязан остаться ELF, на диск он попадёт
+# как USER1.ELF / USER2.ELF, а загрузит его уже kexecve() в ядре.
+USER_ELFS   := $(BUILD)/user1.elf $(BUILD)/user2.elf
+
+$(BUILD)/user%.elf: $(BUILD)/asm/programs/start.o $(BUILD)/c/programs/user%.o programs/user.ld
+	$(LD) -m elf_i386 -nostdlib -T programs/user.ld -o $@ \
+		$(BUILD)/asm/programs/start.o $(BUILD)/c/programs/user$*.o
+	@echo "built $@ (`stat -c%s $@` bytes)"
+
 # --- плоский образ ядра (linker.ld: OUTPUT_FORMAT("binary"), точка входа 0x10000) ---
 $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(ASM_OBJS) $(C_OBJS)
@@ -94,9 +105,9 @@ $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 # 4085 кластеров (иначе это FAT12 по спецификации), а на 1.44 МБ их
 # максимум ~2880. Кроме того, ядру нужен драйвер диска в защищённом
 # режиме — ATA PIO на HDD проще и надёжнее, чем FDC на дискете.
-$(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(MKFATIMG)
+$(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(USER_ELFS) $(MKFATIMG)
 ifdef HAVE_PYFATFS
-	$(PYTHON) $(MKFATIMG) $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $@
+	$(PYTHON) $(MKFATIMG) $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $@ $(USER_ELFS)
 	@echo "built $@ (`stat -c%s $@` bytes)"
 else
 	@echo "error: для сборки образа нужен pyfatfs (pip install pyfatfs)"
