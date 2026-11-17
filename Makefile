@@ -57,7 +57,7 @@ MKFATIMG    := tools/mkfatimg.py
 # Если его нет — цель пропускается с предупреждением, а не падает.
 PYTHON      ?= python3
 HAVE_UNICORN := $(shell $(PYTHON) -c "import unicorn" 2>/dev/null && echo 1)
-HAVE_PYFATFS := $(shell $(PYTHON) -c "import pyfatfs" 2>/dev/null && echo 1)
+HAVE_MTOOLS  := $(shell command -v mformat >/dev/null && command -v mcopy >/dev/null && echo 1)
 
 .PHONY: all run test fattest boottest layout-check clean
 
@@ -106,11 +106,11 @@ $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 # максимум ~2880. Кроме того, ядру нужен драйвер диска в защищённом
 # режиме — ATA PIO на HDD проще и надёжнее, чем FDC на дискете.
 $(IMAGE): $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $(USER_ELFS) $(MKFATIMG)
-ifdef HAVE_PYFATFS
+ifdef HAVE_MTOOLS
 	$(PYTHON) $(MKFATIMG) $(BOOT_BIN) $(BOOT2_BIN) $(KERNEL_BIN) $@ $(USER_ELFS)
 	@echo "built $@ (`stat -c%s $@` bytes)"
 else
-	@echo "error: для сборки образа нужен pyfatfs (pip install pyfatfs)"
+	@echo "error: для сборки образа нужен mtools (sudo apt-get install mtools)"
 	@false
 endif
 
@@ -182,7 +182,7 @@ endif
 #
 # Тест линкуется с настоящим fs/fat16.c и работает по образу, который
 # собирает mkfatimg.py: структуру ФС создаёт независимая реализация
-# (pyfatfs), поэтому драйвер проверяется против чужого кода, а не
+# (mtools), поэтому драйвер проверяется против чужого кода, а не
 # против самого себя.
 $(BUILD)/tests/fat_start.o: $(TEST_DIR)/fat_start.asm
 	@mkdir -p $(dir $@)
