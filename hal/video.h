@@ -22,6 +22,8 @@
 #define VIDEO_GLYPH_W   8
 #define VIDEO_GLYPH_H   16
 #define VIDEO_FG        0x00C0C0C0u     /* светло-серый, 0x00RRGGBB */
+#define VIDEO_FG_GREEN  0x0040E040u     /* статус [ok...] */
+#define VIDEO_FG_RED    0x00E04040u     /* статус [BUG] */
 
 /* Инициализация: разобрать параметры, оставленные загрузчиком.
  * Возвращает 1, если графический режим активен, 0 — текстовый. */
@@ -37,8 +39,13 @@ void video_clear(void);
 /* Прокрутить содержимое на одну текстовую строку вверх. */
 void video_scroll(void);
 
-/* Нарисовать символ c в позиции (row, col). */
+/* Нарисовать символ c в позиции (row, col) обычным цветом. */
 void video_putc(unsigned int row, unsigned int col, char c);
+
+/* То же, но цветом fg (0x00RRGGBB). В текстовом режиме цвет
+ * сводится к ближайшему атрибуту VGA: зелёный 0x0A, красный 0x0C,
+ * всё остальное — обычный 0x07. */
+void video_putc_color(unsigned int row, unsigned int col, char c, uint32_t fg);
 
 /* Режим, выбранный при инициализации: 1 — графический VBE, 0 — текст. */
 int video_is_graphics(void);

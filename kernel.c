@@ -44,18 +44,94 @@ static void layout_init(void)
     }
 }
 
+/* Нарисовать один символ заданным цветом (+ дублирование в COM1
+ * без цвета: серийный лог остаётся обычным текстом для парсинга). */
+static void draw_char(unsigned int row, unsigned int col, char c, uint32_t fg)
+{
+    video_putc_color(row, page_x + col, c, fg);
+    serial_putc(c);
+}
+
+/* Статус-маркеры в квадратных скобках красятся целиком, вместе со
+ * скобками: "[ok...]" — зелёным, "[BUG]" — красным. Цвет известен
+ * только по закрывающей скобке, поэтому текст от '[' буферизуем:
+ *   - началось с "ok"  -> VIDEO_FG_GREEN
+ *   - равно "BUG"      -> VIDEO_FG_RED
+ *   - всё остальное (например, индекс "[12]" в карте E820) — обычным
+ * Если скобка не закрылась за BRACKET_MAX символов — печатаем как есть. */
+#define BRACKET_MAX 24
+static char bracket_buf[BRACKET_MAX];
+static unsigned int bracket_len;
+static unsigned int bracket_col;
+static int bracket_open;
+
+static uint32_t bracket_color(void)
+{
+    if (bracket_len >= 2 && bracket_buf[0] == 'o' && bracket_buf[1] == 'k')
+        return VIDEO_FG_GREEN;
+    if (bracket_len == 3 && bracket_buf[0] == 'B' && bracket_buf[1] == 'U' &&
+        bracket_buf[2] == 'G')
+        return VIDEO_FG_RED;
+    return VIDEO_FG;
+}
+
+/* Вывести накопленный внутренний текст скобок ('[' уже на экране),
+ * вернуть следующую колонку. */
+static unsigned int bracket_flush(unsigned int row, uint32_t fg)
+{
+    unsigned int len = bracket_len;
+
+    for (unsigned int i = 0; i < len; i++)
+        draw_char(row, bracket_col + 1 + i, bracket_buf[i], fg);
+    bracket_open = 0;
+    bracket_len = 0;
+    return bracket_col + 1 + len;
+}
+
 /* Записывает один символ в ячейку (row, col).
  *   Возвращает колонку, в которую нужно писать следующий символ. */
 static unsigned int put_char(unsigned int row, unsigned int col, char c)
 {
-    if (row >= ROWS || col >= page_w)
+    if (row >= ROWS)
+        return col;
+
+    /* Внутри "[...]": копим, пока не увидим ']' или не переполнимся.
+     * Колонка при этом стоит: реальный вывод сделает bracket_flush. */
+    if (bracket_open) {
+        if (c == ']') {
+            /* Цвет наконец известен: перекрашиваем '[' и всё внутри. */
+            uint32_t fg = bracket_color();
+            unsigned int len = bracket_len;
+
+            /* '[' в COM1 уже ушла при первой отрисовке — повторно
+             * только в видео, иначе в логе будет "[[ok]". */
+            video_putc_color(row, page_x + bracket_col, '[', fg);
+            for (unsigned int i = 0; i < len; i++)
+                draw_char(row, bracket_col + 1 + i, bracket_buf[i], fg);
+            draw_char(row, bracket_col + 1 + len, ']', fg);
+            bracket_open = 0;
+            bracket_len = 0;
+            return bracket_col + len + 2;
+        }
+        if (bracket_len < BRACKET_MAX) {
+            bracket_buf[bracket_len++] = c;
+            return col;
+        }
+        col = bracket_flush(row, VIDEO_FG);     /* не статус: как есть */
+    }
+
+    if (col >= page_w)
         return col;                     /* за пределами колонки: пропускаем */
 
-    video_putc(row, page_x + col, c);
-    /* Дублируем в COM1: на экране помещается 48 строк, отчёт длиннее,
-     * и верх уходит при прокрутке. Последовательный порт сохраняет
-     * весь вывод целиком — это видно в эмуляторе и в `qemu -serial stdio`. */
-    serial_putc(c);
+    if (c == '[') {
+        bracket_open = 1;
+        bracket_len = 0;
+        bracket_col = col;
+        draw_char(row, col, '[', VIDEO_FG);     /* перекрасится по ']' */
+        return col + 1;
+    }
+
+    draw_char(row, col, c, VIDEO_FG);
     return col + 1;
 }
 
@@ -118,6 +194,8 @@ static unsigned int cursor_row;
 /* Начать новую строку, прокрутив экран при необходимости */
 static void newline(void)
 {
+    if (bracket_open)                   /* незакрытая '[' — как есть */
+        bracket_flush(cursor_row, VIDEO_FG);
     serial_putc('\n');
     cursor_row++;
     if (cursor_row < ROWS)

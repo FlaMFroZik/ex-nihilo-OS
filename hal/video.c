@@ -137,7 +137,7 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
  * Символы
  * ------------------------------------------------------------------ */
 
-void video_putc(unsigned int row, unsigned int col, char c)
+void video_putc_color(unsigned int row, unsigned int col, char c, uint32_t fg)
 {
     if (row >= rows || col >= cols)
         return;
@@ -146,7 +146,8 @@ void video_putc(unsigned int row, unsigned int col, char c)
         volatile uint8_t *cell = TEXT_MEM + (row * TEXT_COLS + col) * 2;
 
         cell[0] = (uint8_t)c;
-        cell[1] = TEXT_ATTR;
+        cell[1] = (fg == VIDEO_FG_GREEN) ? 0x0A :
+                  (fg == VIDEO_FG_RED)   ? 0x0C : TEXT_ATTR;
         return;
     }
 
@@ -161,9 +162,14 @@ void video_putc(unsigned int row, unsigned int col, char c)
         for (uint32_t gx = 0; gx < VIDEO_GLYPH_W; gx++) {
             uint32_t on = (bits >> (7 - gx)) & 1u;
 
-            put_pixel(x + gx, y + gy, on ? VIDEO_FG : 0);
+            put_pixel(x + gx, y + gy, on ? fg : 0);
         }
     }
+}
+
+void video_putc(unsigned int row, unsigned int col, char c)
+{
+    video_putc_color(row, col, c, VIDEO_FG);
 }
 
 void video_clear(void)
