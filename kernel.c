@@ -88,9 +88,10 @@ static unsigned int bracket_flush(unsigned int row, uint32_t fg)
     return bracket_col + 1 + len;
 }
 
-/* Записывает один символ в ячейку (row, col).
- *   Возвращает колонку, в которую нужно писать следующий символ. */
-static unsigned int put_char(unsigned int row, unsigned int col, char c)
+/* Отрисовать один символ в ячейку (row, col) с учётом раскраски
+ * статус-скобок выше. Возвращает следующую колонку. Вызывается
+ * только из flush_line(): напрямую сюда текст больше не ходит. */
+static unsigned int render_char(unsigned int row, unsigned int col, char c)
 {
     if (row >= ROWS)
         return col;
@@ -133,6 +134,47 @@ static unsigned int put_char(unsigned int row, unsigned int col, char c)
 
     draw_char(row, col, c, VIDEO_FG);
     return col + 1;
+}
+
+/* ---------------------------------------------------------------
+ * Фильтр строк: на экран (и в COM1) попадают ТОЛЬКО строки, в
+ * которых есть квадратная скобка, — статусы "[ok]"/"[BUG]" и
+ * записи E820 "[i] ...". Весь остальной технический текст отчёта
+ * (заголовки, размеры, счётчики, листинги) подавляется.
+ *
+ * Реализация: put_char() не рисует, а собирает строку в буфер;
+ * newline() печатает её через render_char() (с раскраской скобок),
+ * только если в ней встретилась '['. Подачи с явной колонкой
+ * (out(..., 2, text)) при этом становятся последовательными —
+ * все такие места и так продолжают строку с текущей позиции.
+ * --------------------------------------------------------------- */
+#define LINE_MAX 256
+static char line_buf[LINE_MAX];
+static unsigned int line_len;
+static int line_has_bracket;
+
+static unsigned int put_char(unsigned int row, unsigned int col, char c)
+{
+    (void)row;
+    if (line_len < LINE_MAX) {
+        line_buf[line_len++] = c;
+        if (c == '[')
+            line_has_bracket = 1;
+    }
+    return col + 1;
+}
+
+static unsigned int cursor_row;       /* определение — ниже, у newline() */
+
+/* Напечатать собранную строку на текущей строке экрана. */
+static void flush_line(void)
+{
+    unsigned int col = 0;
+
+    for (unsigned int i = 0; i < line_len; i++)
+        col = render_char(cursor_row, col, line_buf[i]);
+    if (bracket_open)                   /* незакрытая '[' — как есть */
+        bracket_flush(cursor_row, VIDEO_FG);
 }
 
 /* Прокрутка экрана на одну строку вверх.
@@ -191,12 +233,23 @@ static unsigned int out_dec(unsigned int row, unsigned int col, uintptr_t value)
 /* Текущая строка вывода: все сообщения идут вниз, экран прокручивается */
 static unsigned int cursor_row;
 
-/* Начать новую строку, прокрутив экран при необходимости */
+/* Начать новую строку, прокрутив экран при необходимости.
+ * Собранная строка печатается, только если в ней есть '[' (см.
+ * фильтр выше); остальные строки не занимают места на экране,
+ * не уходят в COM1 и не двигают курсор. */
 static void newline(void)
 {
-    if (bracket_open)                   /* незакрытая '[' — как есть */
-        bracket_flush(cursor_row, VIDEO_FG);
-    serial_putc('\n');
+    int show = line_has_bracket;
+
+    if (show) {
+        flush_line();
+        serial_putc('\n');
+    }
+    line_len = 0;
+    line_has_bracket = 0;
+    if (!show)
+        return;
+
     cursor_row++;
     if (cursor_row < ROWS)
         return;
