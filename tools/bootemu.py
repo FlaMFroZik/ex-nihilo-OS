@@ -762,6 +762,38 @@ def main():
     check(has(r"USER1\.ELF:\s+hello\s+from\s+ELF"), "USER1.ELF загружен с диска и исполняется")
     check(has(r"USER2\.ELF:\s+argv\[1\]=passed-by-user1"), "argv пережил два execve подряд")
     check(has(r"execve\s+chain\s+to\s+USER2\.ELF:.*\[ok"), "цепочка execve USER1.ELF -> USER2.ELF завершилась кодом 42")
+
+    # Цвет статус-маркеров: ядро красит "[ok...]" зелёным, "[BUG]" —
+    # красным. Декодер выше смотрит только «пиксель включён», поэтому
+    # цвет проверяем отдельно по сырым пикселям ячейки со скобкой.
+    def cell_fg(row, col):
+        """Доминирующий ненулевой цвет пикселей ячейки (row, col)."""
+        counts = {}
+        for gy in range(16):
+            off = (row * 16 + gy) * VBE_PITCH + col * 8 * 4
+            for gx in range(8):
+                px = int.from_bytes(lfb[off + gx * 4:off + gx * 4 + 4],
+                                    "little") & 0xFFFFFF
+                if px:
+                    counts[px] = counts.get(px, 0) + 1
+        return max(counts, key=counts.get) if counts else 0
+
+    def is_green(px):
+        r, g, b = (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF
+        return g > 100 and g > r + 30 and g > b + 30
+
+    green_at = None
+    for r, row_text in enumerate(screen_rows):
+        c = row_text.find("[ok")
+        if c >= 0:
+            green_at = (r, c)
+            break
+    check(green_at is not None and is_green(cell_fg(*green_at)),
+          "маркер [ok] на экране нарисован зелёным (ячейка %s)" % (green_at,))
+
+    hdr_px = cell_fg(0, 4)      # обычный текст заголовка — серый
+    check(hdr_px != 0 and abs(((hdr_px >> 16) & 0xFF) - ((hdr_px >> 8) & 0xFF)) < 30,
+          "обычный текст остался серым, а не цветным")
     check(disk.writes > 0, "запись действительно дошла до диска")
 
     # 5) образ изменился ровно в тех секторах, куда писал драйвер
