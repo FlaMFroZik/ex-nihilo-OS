@@ -9,6 +9,12 @@
 #include "kernel/syscall.h"
 #include "kernel/user.h"
 #include "kernel/exec.h"
+#include "kernel/paging.h"
+
+/* Регион user-кода внутри ядра (linker.ld): его страницы paging
+ * помечает User, всё остальное ядро остаётся Supervisor. */
+extern uint8_t user_region_start[];
+extern uint8_t user_region_end[];
 
 /* Вывод идёт через hal/video.c: в графическом режиме VBE 1024x768
  * со шрифтом 8x16 это 128x48 символов, в текстовом — 80x25.
@@ -580,12 +586,16 @@ void kmain(void)
         emit_dec("kmount failed, rc ", (uintptr_t)(int32_t)mrc, " - syscall demo skipped.");
     } else {
         syscall_cpu_init();             /* GDT(user/TSS) + IDT[0x80] */
+        paging_init();                  /* защита памяти: CR0.PG|WP */
+        paging_map((uint32_t)(uintptr_t)user_region_start,
+                   (uint32_t)(user_region_end - user_region_start), 1, 1);
         kprint_register(syscall_print);
 
         void *ustack = kpmm_alloc();    /* страница под стек Ring 3 */
         if (ustack == NULL) {
             emit("no page for user stack - demo skipped.");
         } else {
+            paging_map((uint32_t)(uintptr_t)ustack, PAGE_SIZE, 1, 1);
             int code = enter_usermode(user_main,
                                       (char *)ustack + PAGE_SIZE);
             kpmm_free(ustack);
@@ -613,6 +623,22 @@ void kmain(void)
                 out(cursor_row, 0, "  file content via syscall: ");
                 out(cursor_row, 28, user_demo_state.text);
                 newline();
+            }
+
+            /* --- защита памяти: Ring 3 пытается писать в ядро --- */
+            void *bstack = kpmm_alloc();
+            if (bstack != NULL) {
+                paging_map((uint32_t)(uintptr_t)bstack, PAGE_SIZE, 1, 1);
+                int bcode = enter_usermode(user_bad_main,
+                                           (char *)bstack + PAGE_SIZE);
+                kpmm_free(bstack);
+
+                emit_hex("page fault addr: ",
+                         paging_last_fault_addr(), "  [PF]");
+                emit_dec("ring3 write to kernel page: #PF count ",
+                         paging_fault_count(),
+                         (bcode == USER_EXIT_PAGEFAULT)
+                             ? "  [ok, #PF blocked]" : "  [BUG]");
             }
         }
     }
