@@ -55,4 +55,10 @@ unsigned int video_width(void);
 unsigned int video_height(void);
 unsigned int video_bpp(void);
 
+/* Физический адрес LFB и размер кадра в байтах (pitch*height).
+ * Нужны paging_init(), чтобы отобразить видеобуфер после включения
+ * страничной адресации. В текстовом режиме — 0xB8000 и 0. */
+uint32_t video_framebuffer(void);
+uint32_t video_framebuffer_size(void);
+
 #endif

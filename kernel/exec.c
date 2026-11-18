@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "kernel/exec.h"
 #include "kernel/kapi.h"
+#include "kernel/paging.h"
 #include "hal/pmm.h"
 
 /* --- ELF32 (только то, что нужно загрузчику) --- */
@@ -117,7 +118,7 @@ int kexecve(const char *path, char *const argv[], char *const envp[])
         return ELF_ERR_EXEC;
     }
 
-    /* --- сегменты PT_LOAD --- */
+    /* --- сегменты PT_LOAD: проход 1 — только проверка --- */
     uint64_t mem_top = (uint64_t)pmm_total_pages() * PAGE_SIZE;
     if (mem_top > 0xFFFFFFFFull) mem_top = 0xFFFFFFFFull;
     int loads = 0, entry_ok = 0;
@@ -135,25 +136,43 @@ int kexecve(const char *path, char *const argv[], char *const envp[])
             free_file_pages(npages);
             return ELF_ERR_EXEC;
         }
-        uint8_t *dst = (uint8_t *)(uintptr_t)ph.vaddr;
-        uint32_t done = 0;
-        while (done < ph.filesz) {              /* копия сквозь страницы */
-            uint32_t chunk = ph.filesz - done;
-            uint32_t off = ph.offset + done;
-            if (chunk > PAGE_SIZE - (off % PAGE_SIZE))
-                chunk = PAGE_SIZE - (off % PAGE_SIZE);
-            const uint8_t *s = file_ptr(off);
-            for (uint32_t j = 0; j < chunk; j++)
-                dst[done + j] = s[j];
-            done += chunk;
-        }
-        for (uint32_t j = ph.filesz; j < ph.memsz; j++)
-            dst[j] = 0;                         /* bss */
         if (eh.entry >= ph.vaddr && eh.entry < ph.vaddr + ph.memsz)
             entry_ok = 1;
         loads++;
     }
     if (loads == 0 || !entry_ok) { free_file_pages(npages); return ELF_ERR_EXEC; }
+
+    /* Проход 2 — пометить страницы сегмента User+RW (иначе Ring 3
+     * в них не попадёт, а ядро с CR0.WP не сможет писать в RO),
+     * скопировать файл и обнулить bss. Проход 3 — ужать права до
+     * заявленных в PF_W: текст снова станет read-only. */
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        for (uint32_t i = 0; i < eh.phnum; i++) {
+            elf32_phdr_t ph;
+            file_read(&ph, eh.phoff + i * sizeof(ph), sizeof(ph));
+            if (ph.type != PT_LOAD)
+                continue;
+            if (pass == 0) {
+                paging_map(ph.vaddr, ph.memsz, 1, 1);
+                uint8_t *dst = (uint8_t *)(uintptr_t)ph.vaddr;
+                uint32_t done = 0;
+                while (done < ph.filesz) {      /* копия сквозь страницы */
+                    uint32_t chunk = ph.filesz - done;
+                    uint32_t off = ph.offset + done;
+                    if (chunk > PAGE_SIZE - (off % PAGE_SIZE))
+                        chunk = PAGE_SIZE - (off % PAGE_SIZE);
+                    const uint8_t *s = file_ptr(off);
+                    for (uint32_t j = 0; j < chunk; j++)
+                        dst[done + j] = s[j];
+                    done += chunk;
+                }
+                for (uint32_t j = ph.filesz; j < ph.memsz; j++)
+                    dst[j] = 0;                 /* bss */
+            } else {
+                paging_map(ph.vaddr, ph.memsz, 1, (ph.flags & 0x2) != 0);
+            }
+        }
+    }
 
     /* --- стек новой программы: строки, затем argc/argv/envp --- */
     void *new_stack = kpmm_alloc();
@@ -202,6 +221,8 @@ int kexecve(const char *path, char *const argv[], char *const envp[])
     frame[w++] = 0;
     for (int i = 0; i < envc; i++) frame[w++] = (uint32_t)(uintptr_t)env_ptrs[i];
     frame[w++] = 0;
+
+    paging_map((uint32_t)(uintptr_t)new_stack, PAGE_SIZE, 1, 1);
 
     /* Образ загружен: буфер файла и старый стек больше не нужны
      * (исполняемся на стеке Ring 0, старый Ring 3 брошен). */

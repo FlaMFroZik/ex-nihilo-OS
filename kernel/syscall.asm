@@ -27,7 +27,14 @@ RING0_STACK_TOP equ 0x8F000     ; внутри зарезервированно�
 global syscall_cpu_init
 global enter_usermode
 global exec_jump
+global idt_set_gate
+global page_fault_entry
 extern syscall_dispatch
+extern page_fault_note
+extern page_fault_panic
+
+USER_EXIT_PF equ 240            ; enter_usermode: Ring 3 убит по #PF
+                                ; (USER_EXIT_PAGEFAULT в syscall.h)
 
 section .text
 
@@ -84,6 +91,23 @@ syscall_cpu_init:
     ret
 
 ; ---------------------------------------------------------------
+; void idt_set_gate(uint8_t vec, uint32_t handler, uint8_t type_attr)
+; Поставить gate в уже загруженную IDT (paging_init ставит так #PF).
+; ---------------------------------------------------------------
+idt_set_gate:
+    mov eax, [esp + 4]              ; vec
+    mov ecx, [esp + 8]              ; handler
+    mov edx, [esp + 12]             ; type_attr
+    lea eax, [idt + eax * 8]
+    mov word [eax + 0], cx
+    mov word [eax + 2], KERNEL_CS
+    mov byte [eax + 4], 0
+    mov byte [eax + 5], dl
+    shr ecx, 16
+    mov word [eax + 6], cx
+    ret
+
+; ---------------------------------------------------------------
 ; обработчик int 0x80. Сюда попадаем уже в Ring 0, на стеке
 ; (от TSS.ESP0) лежат SS/ESP/EFLAGS/CS/EIP пользователя.
 ; EAX = номер, EBX..EDI = аргументы (см. syscall.h).
@@ -132,6 +156,63 @@ syscall_entry:
     ; сохранённый enter_usermode(), и делаем обычный ret из него.
     mov eax, ebx                ; код завершения от пользователя
     mov [user_exit_code], eax
+    jmp resume_kernel
+
+; ---------------------------------------------------------------
+; #PF (вектор 14, ставит paging_init через idt_set_gate).
+; Кадр в обоих случаях: [ESP]=err, [ESP+4]=EIP, [ESP+8]=CS.
+;   CS&3 == 3 — провинился Ring 3: фиксируем фолт и убиваем его
+;     тем же путём, что SYS_KEXIT, но с кодом USER_EXIT_PF;
+;   иначе фолт в самом ядре — page_fault_panic() (не возвращается).
+; ---------------------------------------------------------------
+page_fault_entry:
+    test dword [esp + 8], 3
+    jnz .user_fault
+
+    pushad
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, KERNEL_DS
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, cr2
+    ; page_fault_panic(cr2, err, eip): err/eip — слоты кадра за
+    ; pushad (32 Б) и сегментами (16 Б): err=+48, eip=+52, каждый
+    ; следующий push сдвигает адрес err ещё на 4.
+    push dword [esp + 52]       ; eip
+    push dword [esp + 52]       ; err (сдвинулся первым push'ем)
+    push eax                    ; cr2
+    call page_fault_panic
+.hang:
+    hlt
+    jmp .hang
+
+.user_fault:
+    pushad
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, KERNEL_DS
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, cr2
+    push dword [esp + 52]       ; eip
+    push dword [esp + 52]       ; err
+    push eax                    ; cr2
+    call page_fault_note        ; записать адрес/ошибку для отчёта
+    add esp, 12
+
+    mov dword [user_exit_code], USER_EXIT_PF
+    ; fallthrough в общий возврат в ядро
+
+resume_kernel:
     mov esp, [saved_kernel_esp]
     mov ax, KERNEL_DS
     mov ds, ax

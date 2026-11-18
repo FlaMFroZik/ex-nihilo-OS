@@ -30,15 +30,16 @@ import sys
 try:
     from unicorn import (
         Uc, UcError, UC_ARCH_X86, UC_MODE_16, UC_MODE_32, UC_HOOK_INTR,
-        UC_HOOK_CODE, UC_HOOK_BLOCK,
+        UC_HOOK_CODE, UC_HOOK_BLOCK, UC_HOOK_MEM_INVALID, UC_MEM_WRITE,
+        UC_MEM_WRITE_UNMAPPED,
     )
     from unicorn import UC_HOOK_INSN
     from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT, UC_X86_INS_HLT
     from unicorn.x86_const import (
         UC_X86_REG_AH, UC_X86_REG_AL, UC_X86_REG_BX, UC_X86_REG_CH,
         UC_X86_REG_CL, UC_X86_REG_DH, UC_X86_REG_DI, UC_X86_REG_DL,
-        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EFLAGS,
-        UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_CS, UC_X86_REG_CR0,
+        UC_X86_REG_EAX, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDX, UC_X86_REG_EFLAGS,
+        UC_X86_REG_EIP, UC_X86_REG_ES, UC_X86_REG_CS, UC_X86_REG_CR0, UC_X86_REG_CR2, UC_X86_REG_CR3,
         UC_X86_REG_ESP, UC_X86_REG_EBP, UC_X86_REG_EDI, UC_X86_REG_ESI,
         UC_X86_REG_DS, UC_X86_REG_SS, UC_X86_REG_FS, UC_X86_REG_GS,
         UC_X86_REG_GDTR, UC_X86_REG_IDTR, UC_X86_REG_TR,
@@ -577,14 +578,124 @@ def main():
     #   * финальный `iret` обработчика при равном CPL не снял бы
     #     ESP/SS со стека, поэтому перехватываем его UC_HOOK_CODE и
     #     восстанавливаем контекст Ring3 сами, как сделал бы CPU.
-    syscall_state = {"active": False}
+    #   * unicorn выполняет обработчик с CPL=3 (его нельзя поднять
+    #     reg_write'ом), а с включённым paging доступы обработчика к
+    #     supervisor-страницам ядра дали бы #PF уже внутри эмулятора.
+    #     Поэтому на время обработчика во всех present-страницах
+    #     гостя поднимаем U/S-бит (записав старые значения) и на
+    #     iret возвращаем — таблицам ядра это не вредит, гость-
+    #     unicorn видит ровно то, что видел бы Ring 0 на железе.
+    gate_state = {"active": False, "saved": [], "exc": None}
 
     def _push32(val):
         esp = mu2.reg_read(UC_X86_REG_ESP) - 4
         mu2.reg_write(UC_X86_REG_ESP, esp)
         mu2.mem_write(esp, struct.pack("<I", val & 0xFFFFFFFF))
 
+    def _lift_supervisor(u):
+        cr3 = u.reg_read(UC_X86_REG_CR3) & ~0xFFF
+        saved = []
+        for pdi in range(1024):
+            pde = struct.unpack("<I", bytes(u.mem_read(cr3 + pdi * 4, 4)))[0]
+            if not (pde & 1):
+                continue
+            pt = pde & ~0xFFF
+            for pti in range(1024):
+                a = pt + pti * 4
+                v = struct.unpack("<I", bytes(u.mem_read(a, 4)))[0]
+                if (v & 1) and not (v & 4):
+                    saved.append((a, v))
+                    u.mem_write(a, struct.pack("<I", v | 4))
+        gate_state["saved"] = saved
+
+    def _restore_supervisor(u):
+        for a, v in gate_state["saved"]:
+            u.mem_write(a, struct.pack("<I", v))
+        gate_state["saved"] = []
+
     def on_intr2(u, intno, _):
+        if intno == 13 and gate_state["active"]:
+            # #GP от привилегированных инструкций обработчика при
+            # эмулированном CPL=3: invlpg пропускаем, mov eax, cr2
+            # подставляем сами (на железе CPL=0, всё честно).
+            eip = u.reg_read(UC_X86_REG_EIP)
+            code = bytes(u.mem_read(eip, 3))
+            if code[:2] == b"\x0f\x01":          # invlpg (у нас 3 байта)
+                u.reg_write(UC_X86_REG_EIP, eip + 3)
+                return
+            if code == b"\x0f\x20\xd0":          # mov eax, cr2
+                u.reg_write(UC_X86_REG_EAX, u.reg_read(UC_X86_REG_CR2))
+                u.reg_write(UC_X86_REG_EIP, eip + 3)
+                return
+        if intno == 14:
+            # unicorn присылает #PF именно сюда (а не в MEM_INVALID):
+            # доставляем обработчик ядра вручную. CR2 уже выставил
+            # сам unicorn, адрес фолта берём из него.
+            cr2 = u.reg_read(UC_X86_REG_CR2)
+            user_esp = u.reg_read(UC_X86_REG_ESP)
+            user_ss = u.reg_read(UC_X86_REG_SS)
+            user_cs = u.reg_read(UC_X86_REG_CS)
+            user_eip = u.reg_read(UC_X86_REG_EIP)
+            user_eflags = u.reg_read(UC_X86_REG_EFLAGS)
+            idtr = u.reg_read(UC_X86_REG_IDTR)
+            gdtr = u.reg_read(UC_X86_REG_GDTR)
+            tr = u.reg_read(UC_X86_REG_TR)
+            ent = bytes(u.mem_read(idtr[1] + 14 * 8, 8))
+            handler = struct.unpack("<H", ent[0:2])[0] | \
+                (struct.unpack("<H", ent[6:8])[0] << 16)
+            if handler == 0 or gate_state["active"]:
+                return
+            desc = bytes(u.mem_read(gdtr[1] + (tr[0] & ~7), 8))
+            tss_base = struct.unpack("<H", desc[2:4])[0] | \
+                (desc[4] << 16) | (desc[7] << 24)
+            esp0 = struct.unpack("<I", bytes(u.mem_read(tss_base + 4, 4)))[0]
+            cr3 = u.reg_read(UC_X86_REG_CR3) & ~0xFFF
+            pde = struct.unpack("<I", bytes(u.mem_read(
+                cr3 + (cr2 >> 22) * 4, 4)))[0]
+            present = 0
+            if pde & 1:
+                pte = struct.unpack("<I", bytes(u.mem_read(
+                    (pde & ~0xFFF) + ((cr2 >> 12) & 0x3FF) * 4, 4)))[0]
+                present = pte & 1
+            err = 0x4 | (0x1 if present else 0) | (0x2 if present else 0)
+            acc = gdtr[1] + 16 + 5  # DPL дескриптора данных ядра (см. int 0x80)
+            u.mem_write(acc, bytes([bytes(u.mem_read(acc, 1))[0] | 0x60]))
+            u.reg_write(UC_X86_REG_ESP, esp0)
+            _push32(user_ss)
+            _push32(user_esp)
+            _push32(user_eflags & ~0x200)
+            _push32(user_cs)
+            _push32(user_eip)
+            _push32(err)
+            # Вход в обработчик — сразу после его `mov eax, cr2`:
+            # инструкция привилегированная и при CPL=3 unicorn дал
+            # бы #GP->#DF. pushad/сегменты до неё эмулируем вручную,
+            # EAX подставляем из CR2 unicorn'а.
+            frame_esp = u.reg_read(UC_X86_REG_ESP)
+            for reg in (UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EDX,
+                        UC_X86_REG_EBX):
+                _push32(u.reg_read(reg))
+            _push32(frame_esp)
+            for reg in (UC_X86_REG_EBP, UC_X86_REG_ESI, UC_X86_REG_EDI,
+                        UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_FS,
+                        UC_X86_REG_GS):
+                _push32(u.reg_read(reg))
+            for reg in (UC_X86_REG_DS, UC_X86_REG_ES, UC_X86_REG_FS,
+                        UC_X86_REG_GS):
+                u.reg_write(reg, 0x10)
+            code = bytes(u.mem_read(handler, 256))
+            occ = []
+            pos = code.find(b"\x0f\x20\xd0")
+            while pos >= 0:
+                occ.append(pos)
+                pos = code.find(b"\x0f\x20\xd0", pos + 1)
+            # Первое вхождение — путь паники Ring 0, второе — Ring 3.
+            off = occ[0] if (user_cs & 3) == 0 else (occ[1] if len(occ) > 1 else -1)
+            u.reg_write(UC_X86_REG_EAX, cr2)
+            _lift_supervisor(u)
+            gate_state["active"] = True
+            u.reg_write(UC_X86_REG_EIP, handler + (off + 3 if off >= 0 else 0))
+            return
         if intno != 0x80:
             return
         idtr = u.reg_read(UC_X86_REG_IDTR)
@@ -612,18 +723,81 @@ def main():
         _push32(eflags & ~0x200)                # interrupt gate гасит IF
         _push32(user_cs)
         _push32(user_eip)
-        syscall_state["active"] = True
+        _lift_supervisor(u)
+        gate_state["active"] = True
         u.reg_write(UC_X86_REG_EIP, handler)
 
-    def on_code_syscall(u, addr, size, _):
-        if not syscall_state["active"]:
+    def on_mem_invalid(u, access, address, size, value, _):
+        # Настоящий #PF (вектор 14): доставляем gate вручную, как CPU:
+        # кадр err/EIP/CS/ESP/SS на стек Ring 0 из TSS (обработчик
+        # смотрит CS из кадра, чтобы отличить Ring 3), CR2 = адрес.
+        # Ошибка: U/S=1 (Ring 3), W/R по доступу, P=1 для защиты.
+        if gate_state["active"] or address >= 0x6000000:
+            return False                    # фолт в обработчике — стоп
+        user_esp = u.reg_read(UC_X86_REG_ESP)
+        user_ss = u.reg_read(UC_X86_REG_SS)
+        user_cs = u.reg_read(UC_X86_REG_CS)
+        user_eip = u.reg_read(UC_X86_REG_EIP)
+        user_eflags = u.reg_read(UC_X86_REG_EFLAGS)
+
+        idtr = u.reg_read(UC_X86_REG_IDTR)
+        gdtr = u.reg_read(UC_X86_REG_GDTR)
+        tr = u.reg_read(UC_X86_REG_TR)
+        ent = bytes(u.mem_read(idtr[1] + 14 * 8, 8))
+        handler = struct.unpack("<H", ent[0:2])[0] | \
+            (struct.unpack("<H", ent[6:8])[0] << 16)
+        if handler == 0:
+            return False
+        desc = bytes(u.mem_read(gdtr[1] + (tr[0] & ~7), 8))
+        tss_base = struct.unpack("<H", desc[2:4])[0] | \
+            (desc[4] << 16) | (desc[7] << 24)
+        esp0 = struct.unpack("<I", bytes(u.mem_read(tss_base + 4, 4)))[0]
+
+        cr3 = u.reg_read(UC_X86_REG_CR3) & ~0xFFF
+        pde = struct.unpack("<I", bytes(u.mem_read(cr3 + (address >> 22) * 4, 4)))[0]
+        present = 0
+        if pde & 1:
+            pte = struct.unpack("<I", bytes(u.mem_read(
+                (pde & ~0xFFF) + ((address >> 12) & 0x3FF) * 4, 4)))[0]
+            present = pte & 1
+        err = 0x4 | (0x2 if access in (UC_MEM_WRITE, UC_MEM_WRITE_UNMAPPED)
+                     else 0) | (0x1 if present else 0)
+
+        u.reg_write(UC_X86_REG_CR2, address)
+        u.reg_write(UC_X86_REG_ESP, esp0)
+        _push32(user_ss)
+        _push32(user_esp)
+        _push32(user_eflags & ~0x200)
+        _push32(user_cs)
+        _push32(user_eip)
+        _push32(err)
+        _lift_supervisor(u)
+        gate_state["active"] = True
+        u.reg_write(UC_X86_REG_EIP, handler)
+        return True
+
+    def on_code_gate(u, addr, size, _):
+        if not gate_state["active"]:
+            return
+        # invlpg — привилегированная, а unicorn ведёт обработчик с
+        # CPL=3 и дал бы #GP. На железе CPL=0 и она выполнится;
+        # unicorn TLB программно не моделирует, просто пропускаем.
+        if bytes(u.mem_read(addr, 2)) == b"\x0f\x01":
+            u.reg_write(UC_X86_REG_EIP, addr + size)
+            return
+        # mov eax, cr2 в обработчике #PF — тоже привилегированная:
+        # подставляем значение сами и пропускаем инструкцию.
+        if bytes(u.mem_read(addr, 3)) == b"\x0f\x20\xd0":
+            u.reg_write(UC_X86_REG_EAX, u.reg_read(UC_X86_REG_CR2))
+            u.reg_write(UC_X86_REG_EIP, addr + size)
             return
         if bytes(u.mem_read(addr, 1))[0] != 0xCF:   # не iret обработчика
             return
         esp = u.reg_read(UC_X86_REG_ESP)
         eip, cs, eflags, user_esp, user_ss = struct.unpack(
             "<5I", bytes(u.mem_read(esp, 20)))
-        syscall_state["active"] = False
+        gate_state["active"] = False
+        _restore_supervisor(u)
         u.reg_write(UC_X86_REG_SS, user_ss)
         u.reg_write(UC_X86_REG_ESP, user_esp)
         u.reg_write(UC_X86_REG_CS, cs)
@@ -631,7 +805,8 @@ def main():
         u.reg_write(UC_X86_REG_EIP, eip)
 
     mu2.hook_add(UC_HOOK_INTR, on_intr2)
-    mu2.hook_add(UC_HOOK_CODE, on_code_syscall)
+    mu2.hook_add(UC_HOOK_CODE, on_code_gate)
+    mu2.hook_add(UC_HOOK_MEM_INVALID, on_mem_invalid)
 
     # Конец работы ядра — hlt-цикл. Ловим код hlt (0xF4) хуком кода:
     # на этот адрес ядро возвращается бесконечно.
@@ -762,6 +937,9 @@ def main():
     print("\nExecve / ELF:")
     check(has(r"USER2\.ELF:\s+argv\[1\]=passed-by-user1"), "argv пережил два execve подряд (USER1.ELF загрузился и ушёл в USER2.ELF)")
     check(has(r"execve\s+chain\s+to\s+USER2\.ELF:.*\[ok"), "цепочка execve USER1.ELF -> USER2.ELF завершилась кодом 42")
+    print("\nЗащита памяти (paging):")
+    check(has(r"ring3\s+write\s+to\s+kernel\s+page:.*\[ok,\s+#PF\s+blocked\]"), "запись Ring 3 в страницу ядра заблокирована #PF")
+    check(has(r"page\s+fault\s+addr:\s+0x00010000\s+\[PF\]"), "#PF пришёл ровно с адреса ядра 0x10000")
 
     # Цвет статус-маркеров: ядро красит "[ok...]" зелёным, "[BUG]" —
     # красным. Декодер выше смотрит только «пиксель включён», поэтому

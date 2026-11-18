@@ -83,6 +83,16 @@ int video_init(void)
     return graphics;
 }
 
+uint32_t video_framebuffer(void)
+{
+    return graphics ? (uint32_t)(uintptr_t)lfb : 0;
+}
+
+uint32_t video_framebuffer_size(void)
+{
+    return graphics ? pitch * height : 0;
+}
+
 int video_is_graphics(void) { return graphics; }
 unsigned int video_cols(void) { return cols; }
 unsigned int video_rows(void) { return rows; }

@@ -47,7 +47,9 @@ void syscall_cpu_init(void);
 
 /* Перейти в Ring 3 на entry со стеком user_stack_top (iret строит
  * кадр SS=0x23/CS=0x1B). Вернётся, когда Ring 3 сделает SYS_KEXIT:
- * возвращает его код завершения. */
+ * возвращает его код завершения. Отдельный код — USER_EXIT_PAGEFAULT:
+ * Ring 3 обратился к чужой памяти, #PF его убил. */
+#define USER_EXIT_PAGEFAULT 240
 int enter_usermode(void (*entry)(void), void *user_stack_top);
 
 /* Диспетчер: вызывается из asm-обработчика int 0x80. */

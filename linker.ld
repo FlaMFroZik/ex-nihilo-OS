@@ -25,6 +25,24 @@ SECTIONS
         *(.data.*)
     }
 
+    /* Регион пользовательского кода внутри ядра (kernel/user.c):
+     * отдельные страницы. paging перепомечает их User, остальные
+     * страницы ядра остаются Supervisor — поэтому user-код и его
+     * данные живут в своих секциях .usertext/.userdata/.userbss
+     * (имена без префикса .text., чтобы их не проглотили вайлдкарды
+     * выше).
+     * ВАЖНО: регион стоит ДО .bss не случайно. .userdata —
+     * инициализированная (PROGBITS), а плоский binary заполняет
+     * нулями всё от конца предыдущей PROGBITS-секции до неё: после
+     * 128-КиБ bitmap из .bss образ раздулся бы на весь её размер. */
+    . = ALIGN(4096);
+    user_region_start = .;
+    .usertext : { *(.usertext) *(.usertext.*) }
+    .userdata : { *(.userdata) *(.userdata.*) }
+    .userbss : { *(.userbss) *(.userbss.*) }
+    . = ALIGN(4096);
+    user_region_end = .;
+
     /* .bss не попадает в файл (образ — плоский binary), но адреса
      * всё равно резервируются: pmm_init() обнуляет bitmap сам. */
     .bss : SUBALIGN(4) {

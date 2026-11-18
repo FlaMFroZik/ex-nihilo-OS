@@ -18,4 +18,7 @@ struct user_demo_state {
 extern struct user_demo_state user_demo_state;
 void user_main(void);
 
+/* Демо защиты памяти: пишет в код ядра и должен умереть по #PF. */
+void user_bad_main(void);
+
 #endif
