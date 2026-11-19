@@ -33,7 +33,7 @@ import tempfile
 
 SECTOR = 512
 BOOT2_SECTORS = 4                       # должно совпадать с boot.asm
-FAT_BASE_LBA = 64                       # совпадает с Makefile и hal/ata.h
+FAT_BASE_LBA = 128                      # совпадает с Makefile и hal/ata.h
 IMAGE_SECTORS = 32768                   # 16 МиБ
 IMAGE_BYTES = IMAGE_SECTORS * SECTOR
 

@@ -26,10 +26,10 @@ KERNEL_BIN  := $(BUILD)/kernel.bin
 STAGE2_SECTORS := 4
 KERNEL_LBA     := $(shell expr 1 + $(STAGE2_SECTORS))
 IMAGE       := $(BUILD)/os.img
-# FAT16 занимает весь образ после этого сектора. 64 = 1 (boot)
-# + 2 (boot2) + 61 сектор запаса под ядро (ядро сейчас ~32 сектора).
-# Должно совпадать с FAT_BASE_LBA в hal/ata.h и fs/fat16.h.
-FAT_BASE_LBA := 64
+# FAT16 занимает весь образ после этого сектора. 128 = 1 (boot)
+# + 4 (boot2) + 123 сектора запаса под ядро (загрузчик читает 96 секторов = 48 КиБ).
+# Должно совпадать с EXNIHILO_FAT_LBA в hal/ata.h и FAT_BASE_LBA в tools/mkfatimg.py.
+FAT_BASE_LBA := 128
 
 CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-builtin \
                -fno-asynchronous-unwind-tables -nostdlib -std=gnu11 -O2 \
@@ -95,8 +95,8 @@ $(BUILD)/user%.elf: $(BUILD)/asm/programs/start.o $(BUILD)/c/programs/user%.o pr
 # --- плоский образ ядра (linker.ld: OUTPUT_FORMAT("binary"), точка входа 0x10000) ---
 $(KERNEL_BIN): $(ASM_OBJS) $(C_OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(ASM_OBJS) $(C_OBJS)
-	@test `stat -c%s $@` -le 32768 || \
-	  (echo "error: kernel.bin exceeds the 32 KiB the bootloader loads" && rm -f $@ && exit 1)
+	@test `stat -c%s $@` -le 49152 || \
+	  (echo "error: kernel.bin exceeds the 48 KiB the bootloader loads" && rm -f $@ && exit 1)
 	@echo "built $@ (`stat -c%s $@` bytes)"
 
 # --- образ HDD 16 МиБ: boot + boot2 + kernel + FAT16 ---

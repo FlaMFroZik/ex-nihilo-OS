@@ -165,7 +165,7 @@ static int fd_write(void *ctx, uint32_t lba, uint32_t count, const void *buf)
 
 /* ---- сами проверки ---- */
 
-#define FAT_BASE_LBA 64
+#define FAT_BASE_LBA 128
 
 static blockdev_t dev;
 static fat16_volume_t vol;
