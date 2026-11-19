@@ -640,6 +640,16 @@ void kmain(void)
                          (bcode == USER_EXIT_PAGEFAULT)
                              ? "  [ok, #PF blocked]" : "  [BUG]");
             }
+
+            /* --- запуск shell (/SHELL.ELF) --- */
+            void *sstack = kpmm_alloc();
+            if (sstack != NULL) {
+                paging_map((uint32_t)(uintptr_t)sstack, PAGE_SIZE, 1, 1);
+                (void)enter_usermode(user_shell_main,
+                                     (char *)sstack + PAGE_SIZE);
+                kpmm_free(sstack);
+                kexec_cleanup();
+            }
         }
     }
     emit("");

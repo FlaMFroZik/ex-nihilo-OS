@@ -21,4 +21,7 @@ void user_main(void);
 /* Демо защиты памяти: пишет в код ядра и должен умереть по #PF. */
 void user_bad_main(void);
 
+/* Запуск пользовательской оболочки /SHELL.ELF через execve. */
+void user_shell_main(void);
+
 #endif
