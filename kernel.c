@@ -328,12 +328,21 @@ static void syscall_print(const char *str)
         serial_putc(*str);
         if (*str == '\n') {
             print_col = 0;
-            newline();
+            cursor_row++;
+            if (cursor_row >= ROWS) {
+                video_scroll();
+                cursor_row = ROWS - 1;
+            }
         } else if (*str == '\b') {
-            if (print_col > 0)
+            if (print_col > 0) {
                 print_col--;
+                video_putc(cursor_row, print_col, ' ');
+            }
         } else {
-            print_col = put_char(cursor_row, print_col, *str);
+            if (print_col < COLS) {
+                video_putc(cursor_row, print_col, *str);
+                print_col++;
+            }
         }
     }
 }
