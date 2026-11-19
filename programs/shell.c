@@ -283,6 +283,7 @@ static int cmd_help(void)
     sys_kprint("  ls [dir]        list directory contents\n");
     sys_kprint("  cd [dir]        change directory\n");
     sys_kprint("  cat <file>...   print file contents\n");
+    sys_kprint("  rm <path>...    remove files or directories\n");
     sys_kprint("  echo [-n] ...   display a line of text ($?, $PWD)\n");
     sys_kprint("  clear           clear the terminal screen\n");
     sys_kprint("  uname           print system name\n");
