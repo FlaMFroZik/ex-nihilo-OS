@@ -633,18 +633,18 @@ void kmain(void)
                              ? "  [ok, #PF blocked]" : "  [BUG]");
             }
 
-            serial_puts("[dbg] before launching shell\n");
+            serial_write("[dbg] before launching shell\n");
             /* --- запуск shell (/SHELL.ELF) --- */
             emit("launching /SHELL.ELF...");
-            serial_puts("[dbg] after emit launching\n");
+            serial_write("[dbg] after emit launching\n");
             void *sstack = kpmm_alloc();
-            serial_puts("[dbg] after kpmm_alloc\n");
+            serial_write("[dbg] after kpmm_alloc\n");
             if (sstack != NULL) {
                 paging_map((uint32_t)(uintptr_t)sstack, PAGE_SIZE, 1, 1);
-                serial_puts("[dbg] before enter_usermode\n");
+                serial_write("[dbg] before enter_usermode\n");
                 int scode = enter_usermode(user_shell_main,
                                            (char *)sstack + PAGE_SIZE);
-                serial_puts("[dbg] after enter_usermode\n");
+                serial_write("[dbg] after enter_usermode\n");
                 kpmm_free(sstack);
                 kexec_cleanup();
                 emit_dec("shell exited with code: ", scode, "");
