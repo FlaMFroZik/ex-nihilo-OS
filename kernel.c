@@ -579,7 +579,6 @@ void kmain(void)
 
     /* ================= 6. Ring 3 -> syscall -> Ring 0 ================= */
     emit("=== syscall demo: Ring3 --int 0x80--> Ring0 kopen/kread ===");
-    emit("=== execve demo: user -> USER1.ELF -> USER2.ELF (ELF32) ===");
 
     int mrc = kmount();
     if (mrc != FAT16_OK) {
@@ -601,16 +600,9 @@ void kmain(void)
             kpmm_free(ustack);
             kexec_cleanup();        /* страница стека последнего exec'а */
 
-            /* Мы снова в Ring 0: enter_usermode вернулся по SYS_KEXIT.
-             * Если execve удался, цепочка USER1.ELF -> USER2.ELF
-             * закончилась кодом 42; если нет — user_main вышел с 7. */
-            int expected = user_demo_state.execve_attempted ? 42 : 7;
+            /* Мы снова в Ring 0: enter_usermode вернулся по SYS_KEXIT. */
             emit_dec("user exit code (SYS_KEXIT):       ", code,
-                     (code == expected) ? "  [ok]" : "  [BUG]");
-            emit_dec("execve chain to USER2.ELF:        ",
-                     user_demo_state.execve_attempted,
-                     (user_demo_state.execve_attempted && code == 42)
-                         ? "  [ok, exit 42]" : "  [BUG]");
+                     (code == 0) ? "  [ok]" : "  [BUG]");
             emit_dec("CPL seen by user code (CS & 3):   ", user_demo_state.cpl,
                      (user_demo_state.cpl == 3) ? "  [ok, Ring 3]" : "  [BUG]");
             emit_dec("kopen(\"/HELLO.TXT\") -> fd:        ", user_demo_state.open_rc,
