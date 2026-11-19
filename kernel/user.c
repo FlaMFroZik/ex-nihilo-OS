@@ -71,7 +71,7 @@ USER_TEXT void user_shell_main(void)
     char *argv[2];
     argv[0] = arg0_shell;
     argv[1] = 0;
-    sys_execve(path_shell, argv, 0);
+    int erc = sys_execve(path_shell, argv, 0);
     sys_kprint(msg_shell_fail);
-    sys_kexit(1);
+    sys_kexit((erc < 0) ? -erc : 99);
 }

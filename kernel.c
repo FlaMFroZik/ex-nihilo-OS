@@ -645,6 +645,8 @@ void kmain(void)
                 int scode = enter_usermode(user_shell_main,
                                            (char *)sstack + PAGE_SIZE);
                 serial_write("[dbg] after enter_usermode, scode=");
+                if (scode >= 10)
+                    serial_putc((char)('0' + ((scode / 10) % 10)));
                 serial_putc((char)('0' + (scode % 10)));
                 serial_putc('\n');
                 kpmm_free(sstack);
