@@ -37,7 +37,8 @@
 #define SYS_KALLOC  8   /* -> kpmm_alloc() */
 #define SYS_KFREE   9   /* -> kpmm_free()  */
 #define SYS_KEXECVE 10  /* -> kexecve(): при успехе не возвращается */
-#define SYS_MAX     11
+#define SYS_KCLEAR  11  /* -> video_clear(): очистить экран */
+#define SYS_MAX     12
 
 /* --- Сторона Ring 0 (вызывает kmain) --- */
 
@@ -94,6 +95,9 @@ static inline void *sys_kalloc(void)
 
 static inline void sys_kfree(void *addr)
 { (void)syscall5(SYS_KFREE, (uint32_t)addr, 0, 0, 0, 0); }
+
+static inline void sys_kclear(void)
+{ (void)syscall5(SYS_KCLEAR, 0, 0, 0, 0, 0); }
 
 static inline void sys_kexit(int code)
 {

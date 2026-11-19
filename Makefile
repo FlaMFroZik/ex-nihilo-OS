@@ -85,11 +85,16 @@ $(BUILD)/c/%.o: %.c
 # --- пользовательские ELF-программы (programs/): отдельные бинарники ---
 # Это НЕ плоский образ: файл обязан остаться ELF, на диск он попадёт
 # как USER1.ELF / USER2.ELF, а загрузит его уже kexecve() в ядре.
-USER_ELFS   := $(BUILD)/user1.elf $(BUILD)/user2.elf
+USER_ELFS   := $(BUILD)/user1.elf $(BUILD)/user2.elf $(BUILD)/shell.elf
 
 $(BUILD)/user%.elf: $(BUILD)/asm/programs/start.o $(BUILD)/c/programs/user%.o programs/user.ld
 	$(LD) -m elf_i386 -nostdlib -T programs/user.ld -o $@ \
 		$(BUILD)/asm/programs/start.o $(BUILD)/c/programs/user$*.o
+	@echo "built $@ (`stat -c%s $@` bytes)"
+
+$(BUILD)/shell.elf: $(BUILD)/asm/programs/start.o $(BUILD)/c/programs/shell.o programs/user.ld
+	$(LD) -m elf_i386 -nostdlib -T programs/user.ld -o $@ \
+		$(BUILD)/asm/programs/start.o $(BUILD)/c/programs/shell.o
 	@echo "built $@ (`stat -c%s $@` bytes)"
 
 # --- плоский образ ядра (linker.ld: OUTPUT_FORMAT("binary"), точка входа 0x10000) ---

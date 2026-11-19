@@ -31,6 +31,8 @@ static char USER_DATA path_hello[] = "/HELLO.TXT";
 static char USER_DATA path_user1[] = "/USER1.ELF";
 static char USER_DATA arg0_user1[] = "/USER1.ELF";
 static char USER_DATA arg1_user1[] = "from-user-main";
+static char USER_DATA path_shell[] = "/SHELL.ELF";
+static char USER_DATA arg0_shell[] = "/SHELL.ELF";
 
 USER_TEXT void user_main(void)
 {
@@ -80,4 +82,13 @@ USER_TEXT void user_bad_main(void)
 {
     *(volatile uint8_t *)0x10000 = 0x42;
     sys_kexit(8);
+}
+
+USER_TEXT void user_shell_main(void)
+{
+    char *argv[2];
+    argv[0] = arg0_shell;
+    argv[1] = 0;
+    sys_execve(path_shell, argv, 0);
+    sys_kexit(1);
 }
