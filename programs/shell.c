@@ -141,7 +141,7 @@ static void cmd_ls(const char *arg)
 
     while (1) {
         int rc = sys_kreaddir(path, idx, &ent);
-        if (rc == 1)
+        if (rc == 0)
             break;
         if (rc < 0) {
             sys_kprint("ls: cannot open directory\n");
