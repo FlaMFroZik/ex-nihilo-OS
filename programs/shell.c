@@ -3,15 +3,22 @@
 #include "fs/fat16.h"
 
 /* ================================================================
- * SHELL.ELF — интерактивная оболочка (Ring 3), запускаемая ядром.
- * Сразу после запуска очищает экран и работает в цикле команд
- * с приглашением вида "> ".
+ * SHELL.ELF — оболочка с bash-подобным синтаксисом (Ring 3).
+ * Поддерживает:
+ *   - приглашение user@ex-nihilo:<cwd>$
+ *   - кавычки '...' и "...", комментарии #
+ *   - разделители команд ; и &&
+ *   - переменные $? и $PWD
+ *   - команды: pwd, ls, cd, cat, echo [-n], clear, help, exit,
+ *              uname, whoami, true, false
  * ================================================================ */
 
-#define LINE_MAX 128
+#define LINE_MAX 256
 #define PATH_MAX 128
+#define MAX_ARGS 16
 
 static char cwd[PATH_MAX] = "/";
+static int last_status = 0;
 
 static int str_len(const char *s)
 {
@@ -66,6 +73,15 @@ static void print_u32(uint32_t v)
         put_char(buf[--i]);
 }
 
+static void print_int(int v)
+{
+    if (v < 0) {
+        put_char('-');
+        v = -v;
+    }
+    print_u32((uint32_t)v);
+}
+
 static void resolve_path(const char *arg, char *out, int max)
 {
     char tmp[PATH_MAX];
@@ -88,7 +104,6 @@ static void resolve_path(const char *arg, char *out, int max)
         str_copy(tmp + len, arg, PATH_MAX - len);
     }
 
-    /* Нормализация компонент '.' и '..' */
     char norm[PATH_MAX];
     int nlen = 1;
     norm[0] = '/';
@@ -105,9 +120,8 @@ static void resolve_path(const char *arg, char *out, int max)
             i++;
         int clen = i - start;
 
-        if (clen == 1 && tmp[start] == '.') {
+        if (clen == 1 && tmp[start] == '.')
             continue;
-        }
         if (clen == 2 && tmp[start] == '.' && tmp[start + 1] == '.') {
             if (nlen > 1) {
                 nlen--;
@@ -130,10 +144,11 @@ static void resolve_path(const char *arg, char *out, int max)
     str_copy(out, norm, max);
 }
 
-static void cmd_ls(const char *arg)
+static int cmd_ls(int argc, char **argv)
 {
+    const char *target = (argc > 1) ? argv[1] : "";
     char path[PATH_MAX];
-    resolve_path(arg, path, PATH_MAX);
+    resolve_path(target, path, PATH_MAX);
 
     fat16_dirent_t ent;
     uint32_t idx = 0;
@@ -144,8 +159,8 @@ static void cmd_ls(const char *arg)
         if (rc == 0)
             break;
         if (rc < 0) {
-            sys_kprint("ls: cannot open directory\n");
-            return;
+            sys_kprint("ls: cannot access directory\n");
+            return 1;
         }
         if (ent.attr & FAT16_ATTR_DIRECTORY) {
             sys_kprint("  <DIR>  ");
@@ -163,69 +178,240 @@ static void cmd_ls(const char *arg)
     }
     if (count == 0)
         sys_kprint("  (empty)\n");
+    return 0;
 }
 
-static void cmd_cd(const char *arg)
+static int cmd_cd(int argc, char **argv)
 {
-    if (!arg || !arg[0]) {
+    if (argc < 2 || !argv[1][0]) {
         str_copy(cwd, "/", PATH_MAX);
-        return;
+        return 0;
     }
 
     char path[PATH_MAX];
-    resolve_path(arg, path, PATH_MAX);
+    resolve_path(argv[1], path, PATH_MAX);
 
     fat16_dirent_t ent;
     int rc = sys_kreaddir(path, 0, &ent);
     if (rc < 0) {
-        sys_kprint("cd: no such directory\n");
-        return;
+        sys_kprint("bash: cd: no such directory\n");
+        return 1;
     }
     str_copy(cwd, path, PATH_MAX);
+    return 0;
 }
 
-static void cmd_cat(const char *arg)
+static int cmd_cat(int argc, char **argv)
 {
-    if (!arg || !arg[0]) {
-        sys_kprint("usage: cat <file>\n");
-        return;
+    if (argc < 2) {
+        sys_kprint("usage: cat <file>...\n");
+        return 1;
     }
 
-    char path[PATH_MAX];
-    resolve_path(arg, path, PATH_MAX);
+    int status = 0;
+    for (int i = 1; i < argc; i++) {
+        char path[PATH_MAX];
+        resolve_path(argv[i], path, PATH_MAX);
 
-    int fd = sys_kopen(path, 0);
-    if (fd < 0) {
-        sys_kprint("cat: cannot open file\n");
-        return;
-    }
+        int fd = sys_kopen(path, 0);
+        if (fd < 0) {
+            sys_kprint("cat: ");
+            sys_kprint(argv[i]);
+            sys_kprint(": No such file\n");
+            status = 1;
+            continue;
+        }
 
-    char buf[129];
-    int total = 0;
-    while (1) {
-        int n = sys_kread(fd, buf, 128);
-        if (n <= 0)
-            break;
-        buf[n] = '\0';
-        sys_kprint(buf);
-        total += n;
+        char buf[129];
+        int total = 0;
+        while (1) {
+            int n = sys_kread(fd, buf, 128);
+            if (n <= 0)
+                break;
+            buf[n] = '\0';
+            sys_kprint(buf);
+            total += n;
+        }
+        sys_kclose(fd);
+        if (total > 0)
+            sys_kprint("\n");
     }
-    sys_kclose(fd);
-    if (total > 0)
-        sys_kprint("\n");
+    return status;
 }
 
-static void cmd_help(void)
+static int cmd_echo(int argc, char **argv)
 {
+    int i = 1;
+    int newline = 1;
+    if (i < argc && str_eq(argv[i], "-n")) {
+        newline = 0;
+        i++;
+    }
+    for (; i < argc; i++) {
+        if (str_eq(argv[i], "$?")) {
+            print_int(last_status);
+        } else if (str_eq(argv[i], "$PWD")) {
+            sys_kprint(cwd);
+        } else {
+            sys_kprint(argv[i]);
+        }
+        if (i + 1 < argc)
+            put_char(' ');
+    }
+    if (newline)
+        put_char('\n');
+    return 0;
+}
+
+static int cmd_help(void)
+{
+    sys_kprint("GNU bash-like shell for ex-nihilo-OS\n");
     sys_kprint("Commands:\n");
-    sys_kprint("  help        - show this help\n");
-    sys_kprint("  pwd         - print working directory\n");
-    sys_kprint("  ls [dir]    - list directory contents\n");
-    sys_kprint("  cd <dir>    - change directory\n");
-    sys_kprint("  cat <file>  - print file contents\n");
-    sys_kprint("  echo <text> - print text\n");
-    sys_kprint("  clear       - clear screen\n");
-    sys_kprint("  exit        - exit shell\n");
+    sys_kprint("  pwd             print working directory\n");
+    sys_kprint("  ls [dir]        list directory contents\n");
+    sys_kprint("  cd [dir]        change directory\n");
+    sys_kprint("  cat <file>...   print file contents\n");
+    sys_kprint("  echo [-n] ...   display a line of text ($?, $PWD)\n");
+    sys_kprint("  clear           clear the terminal screen\n");
+    sys_kprint("  uname           print system name\n");
+    sys_kprint("  whoami          print effective user\n");
+    sys_kprint("  true / false    return 0 / 1\n");
+    sys_kprint("  help            show this help\n");
+    sys_kprint("  exit            exit the shell\n");
+    sys_kprint("Syntax: quotes '...' \"...\", comments #, operators ; and &&\n");
+    return 0;
+}
+
+static int run_command(int argc, char **argv, int *should_exit)
+{
+    if (argc == 0)
+        return last_status;
+
+    const char *cmd = argv[0];
+    if (str_eq(cmd, "help"))
+        return cmd_help();
+    if (str_eq(cmd, "pwd")) {
+        sys_kprint(cwd);
+        put_char('\n');
+        return 0;
+    }
+    if (str_eq(cmd, "ls"))
+        return cmd_ls(argc, argv);
+    if (str_eq(cmd, "cd"))
+        return cmd_cd(argc, argv);
+    if (str_eq(cmd, "cat"))
+        return cmd_cat(argc, argv);
+    if (str_eq(cmd, "echo"))
+        return cmd_echo(argc, argv);
+    if (str_eq(cmd, "clear")) {
+        sys_kclear();
+        return 0;
+    }
+    if (str_eq(cmd, "uname")) {
+        sys_kprint("ex-nihilo-OS\n");
+        return 0;
+    }
+    if (str_eq(cmd, "whoami")) {
+        sys_kprint("user\n");
+        return 0;
+    }
+    if (str_eq(cmd, "true"))
+        return 0;
+    if (str_eq(cmd, "false"))
+        return 1;
+    if (str_eq(cmd, "exit")) {
+        *should_exit = 1;
+        return 0;
+    }
+
+    sys_kprint("bash: ");
+    sys_kprint(cmd);
+    sys_kprint(": command not found\n");
+    return 127;
+}
+
+static void eval_line(char *line, int *should_exit)
+{
+    char *p = line;
+    int run_next = 1;
+
+    while (*p && !*should_exit) {
+        char *argv[MAX_ARGS];
+        int argc = 0;
+        int sep = 0; /* 0 = end, 1 = ';', 2 = '&&' */
+
+        while (*p) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (!*p || *p == '#') {
+                *p = '\0';
+                break;
+            }
+            if (*p == ';') {
+                p++;
+                sep = 1;
+                break;
+            }
+            if (p[0] == '&' && p[1] == '&') {
+                p += 2;
+                sep = 2;
+                break;
+            }
+
+            if (argc >= MAX_ARGS - 1)
+                break;
+
+            char *arg = p;
+            char *dst = p;
+            while (*p) {
+                if (*p == '\'' || *p == '"') {
+                    char q = *p++;
+                    while (*p && *p != q)
+                        *dst++ = *p++;
+                    if (*p == q)
+                        p++;
+                } else if (*p == ' ' || *p == '\t' || *p == ';' ||
+                           *p == '#' || (p[0] == '&' && p[1] == '&')) {
+                    break;
+                } else {
+                    *dst++ = *p++;
+                }
+            }
+            if (*p == ';') {
+                *dst = '\0';
+                p++;
+                sep = 1;
+                argv[argc++] = arg;
+                break;
+            }
+            if (p[0] == '&' && p[1] == '&') {
+                *dst = '\0';
+                p += 2;
+                sep = 2;
+                argv[argc++] = arg;
+                break;
+            }
+            if (*p == '#') {
+                *dst = '\0';
+                *p = '\0';
+                argv[argc++] = arg;
+                break;
+            }
+            if (*p)
+                p++;
+            *dst = '\0';
+            argv[argc++] = arg;
+        }
+
+        argv[argc] = 0;
+        if (run_next && argc > 0)
+            last_status = run_command(argc, argv, should_exit);
+
+        if (sep == 2)
+            run_next = (last_status == 0);
+        else
+            run_next = 1;
+    }
 }
 
 static int read_line(char *buf, int max)
@@ -258,57 +444,17 @@ int prog_main(int argc, char **argv)
     (void)argv;
 
     sys_kclear();
-    sys_kprint("ex-nihilo-OS shell (type 'help' for commands)\n");
+    sys_kprint("ex-nihilo-OS bash-like shell (type 'help' for commands)\n");
 
     char line[LINE_MAX];
-    for (;;) {
+    int should_exit = 0;
+    while (!should_exit) {
+        sys_kprint("user@ex-nihilo:");
         sys_kprint(cwd);
-        sys_kprint("> ");
+        sys_kprint("$ ");
 
         read_line(line, LINE_MAX);
-
-        /* Пропускаем ведущие пробелы */
-        char *p = line;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '\0')
-            continue;
-
-        /* Отделяем команду и первый аргумент */
-        char *cmd = p;
-        while (*p && *p != ' ' && *p != '\t')
-            p++;
-        char *arg = p;
-        if (*p) {
-            *p++ = '\0';
-            while (*p == ' ' || *p == '\t')
-                p++;
-            arg = p;
-        }
-
-        if (str_eq(cmd, "help")) {
-            cmd_help();
-        } else if (str_eq(cmd, "pwd")) {
-            sys_kprint(cwd);
-            sys_kprint("\n");
-        } else if (str_eq(cmd, "ls")) {
-            cmd_ls(arg);
-        } else if (str_eq(cmd, "cd")) {
-            cmd_cd(arg);
-        } else if (str_eq(cmd, "cat")) {
-            cmd_cat(arg);
-        } else if (str_eq(cmd, "clear")) {
-            sys_kclear();
-        } else if (str_eq(cmd, "echo")) {
-            sys_kprint(arg);
-            sys_kprint("\n");
-        } else if (str_eq(cmd, "exit")) {
-            break;
-        } else {
-            sys_kprint("unknown command: ");
-            sys_kprint(cmd);
-            sys_kprint("\n");
-        }
+        eval_line(line, &should_exit);
     }
 
     return 0;
