@@ -19,6 +19,7 @@
 
 static char cwd[PATH_MAX] = "/";
 static int last_status = 0;
+static int redir_fd = -1;
 
 static int str_len(const char *s)
 {
@@ -49,12 +50,23 @@ static void str_copy(char *dst, const char *src, int max)
     dst[i] = '\0';
 }
 
+static void shell_print(const char *s)
+{
+    if (redir_fd >= 0) {
+        int len = str_len(s);
+        if (len > 0)
+            sys_kwrite(redir_fd, s, (uint32_t)len);
+    } else {
+        sys_kprint(s);
+    }
+}
+
 static void put_char(char c)
 {
     char buf[2];
     buf[0] = c;
     buf[1] = '\0';
-    sys_kprint(buf);
+    shell_print(buf);
 }
 
 static void print_u32(uint32_t v)
@@ -62,7 +74,7 @@ static void print_u32(uint32_t v)
     char buf[12];
     int i = 0;
     if (v == 0) {
-        sys_kprint("0");
+        shell_print("0");
         return;
     }
     while (v > 0 && i < 11) {
@@ -163,21 +175,21 @@ static int cmd_ls(int argc, char **argv)
             return 1;
         }
         if (ent.attr & FAT16_ATTR_DIRECTORY) {
-            sys_kprint("  <DIR>  ");
-            sys_kprint(ent.name);
-            sys_kprint("\n");
+            shell_print("  <DIR>  ");
+            shell_print(ent.name);
+            shell_print("\n");
         } else {
-            sys_kprint("  ");
+            shell_print("  ");
             print_u32(ent.size);
-            sys_kprint("  ");
-            sys_kprint(ent.name);
-            sys_kprint("\n");
+            shell_print("  ");
+            shell_print(ent.name);
+            shell_print("\n");
         }
         idx++;
         count++;
     }
     if (count == 0)
-        sys_kprint("  (empty)\n");
+        shell_print("  (empty)\n");
     return 0;
 }
 
@@ -229,12 +241,12 @@ static int cmd_cat(int argc, char **argv)
             if (n <= 0)
                 break;
             buf[n] = '\0';
-            sys_kprint(buf);
+            shell_print(buf);
             total += n;
         }
         sys_kclose(fd);
         if (total > 0)
-            sys_kprint("\n");
+            shell_print("\n");
     }
     return status;
 }
@@ -251,9 +263,9 @@ static int cmd_echo(int argc, char **argv)
         if (str_eq(argv[i], "$?")) {
             print_int(last_status);
         } else if (str_eq(argv[i], "$PWD")) {
-            sys_kprint(cwd);
+            shell_print(cwd);
         } else {
-            sys_kprint(argv[i]);
+            shell_print(argv[i]);
         }
         if (i + 1 < argc)
             put_char(' ');
@@ -291,7 +303,7 @@ static int run_command(int argc, char **argv, int *should_exit)
     if (str_eq(cmd, "help"))
         return cmd_help();
     if (str_eq(cmd, "pwd")) {
-        sys_kprint(cwd);
+        shell_print(cwd);
         put_char('\n');
         return 0;
     }
@@ -308,11 +320,11 @@ static int run_command(int argc, char **argv, int *should_exit)
         return 0;
     }
     if (str_eq(cmd, "uname")) {
-        sys_kprint("ex-nihilo-OS\n");
+        shell_print("ex-nihilo-OS\n");
         return 0;
     }
     if (str_eq(cmd, "whoami")) {
-        sys_kprint("user\n");
+        shell_print("user\n");
         return 0;
     }
     if (str_eq(cmd, "true"))
@@ -404,8 +416,45 @@ static void eval_line(char *line, int *should_exit)
         }
 
         argv[argc] = 0;
-        if (run_next && argc > 0)
-            last_status = run_command(argc, argv, should_exit);
+
+        /* Обработка перенаправления > и >> */
+        const char *redir_file = 0;
+        int redir_append = 0;
+        int clean_argc = 0;
+        for (int i = 0; i < argc; i++) {
+            if (str_eq(argv[i], ">") && i + 1 < argc) {
+                redir_file = argv[++i];
+                redir_append = 0;
+            } else if (str_eq(argv[i], ">>") && i + 1 < argc) {
+                redir_file = argv[++i];
+                redir_append = 1;
+            } else {
+                argv[clean_argc++] = argv[i];
+            }
+        }
+        argv[clean_argc] = 0;
+
+        if (run_next && clean_argc > 0) {
+            if (redir_file) {
+                char rpath[PATH_MAX];
+                resolve_path(redir_file, rpath, PATH_MAX);
+                int flags = FAT16_O_WRONLY | FAT16_O_CREAT |
+                            (redir_append ? FAT16_O_APPEND : FAT16_O_TRUNC);
+                redir_fd = sys_kopen(rpath, flags);
+                if (redir_fd < 0) {
+                    sys_kprint("bash: cannot open output file\n");
+                    last_status = 1;
+                    redir_fd = -1;
+                    goto next_cmd;
+                }
+            }
+            last_status = run_command(clean_argc, argv, should_exit);
+            if (redir_fd >= 0) {
+                sys_kclose(redir_fd);
+                redir_fd = -1;
+            }
+        }
+next_cmd:
 
         if (sep == 2)
             run_next = (last_status == 0);
