@@ -91,5 +91,6 @@ USER_TEXT void user_shell_main(void)
     argv[0] = arg0_shell;
     argv[1] = 0;
     sys_execve(path_shell, argv, 0);
+    sys_kprint(msg_shell_fail);
     sys_kexit(1);
 }
