@@ -84,6 +84,9 @@ static inline int32_t sys_kread(int fd, void *buf, uint32_t count)
 static inline int32_t sys_kwrite(int fd, const void *buf, uint32_t count)
 { return syscall5(SYS_KWRITE, (uint32_t)fd, (uint32_t)buf, count, 0, 0); }
 
+static inline int32_t sys_kunlink(const char *path)
+{ return syscall5(SYS_KUNLINK, (uint32_t)path, 0, 0, 0, 0); }
+
 static inline int32_t sys_kprint(const char *str)
 { return syscall5(SYS_KPRINT, (uint32_t)str, 0, 0, 0, 0); }
 
