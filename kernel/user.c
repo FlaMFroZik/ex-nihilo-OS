@@ -33,6 +33,7 @@ static char USER_DATA arg0_user1[] = "/USER1.ELF";
 static char USER_DATA arg1_user1[] = "from-user-main";
 static char USER_DATA path_shell[] = "/SHELL.ELF";
 static char USER_DATA arg0_shell[] = "/SHELL.ELF";
+static char USER_DATA msg_shell_fail[] = "user_shell_main: execve(/SHELL.ELF) failed\n";
 
 USER_TEXT void user_main(void)
 {
