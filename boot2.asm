@@ -25,8 +25,8 @@ STAGE2_SECTORS  equ 4                   ; 4 сектора = 2048 Б
 BOOT_DRIVE_ADDR equ 0x0500              ; сюда boot.asm кладёт номер диска
 
 KERNEL_START    equ 0x10000             ; физический адрес загрузки ядра
-KERNEL_SECTORS  equ 64                  ; 64 сектора = 32 КиБ (запас;
-                                        ; FAT16 начинается с сектора 64)
+KERNEL_SECTORS  equ 96                  ; 96 секторов = 48 КиБ (запас;
+                                        ; FAT16 начинается с сектора 128)
 KERNEL_LBA      equ 1 + STAGE2_SECTORS  ; ядро сразу после второго этапа
 MAX_RETRIES     equ 3
 
