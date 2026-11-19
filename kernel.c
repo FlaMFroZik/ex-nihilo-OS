@@ -642,13 +642,15 @@ void kmain(void)
             }
 
             /* --- запуск shell (/SHELL.ELF) --- */
+            emit("launching /SHELL.ELF...");
             void *sstack = kpmm_alloc();
             if (sstack != NULL) {
                 paging_map((uint32_t)(uintptr_t)sstack, PAGE_SIZE, 1, 1);
-                (void)enter_usermode(user_shell_main,
-                                     (char *)sstack + PAGE_SIZE);
+                int scode = enter_usermode(user_shell_main,
+                                           (char *)sstack + PAGE_SIZE);
                 kpmm_free(sstack);
                 kexec_cleanup();
+                emit_dec("shell exited with code: ", scode, "");
             }
         }
     }
