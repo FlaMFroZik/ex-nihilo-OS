@@ -275,6 +275,29 @@ static int cmd_echo(int argc, char **argv)
     return 0;
 }
 
+static int cmd_rm(int argc, char **argv)
+{
+    if (argc < 2) {
+        sys_kprint("usage: rm <file|dir>...\n");
+        return 1;
+    }
+
+    int status = 0;
+    for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "-r") || str_eq(argv[i], "-rf") || str_eq(argv[i], "-f"))
+            continue;
+        char path[PATH_MAX];
+        resolve_path(argv[i], path, PATH_MAX);
+        if (sys_kunlink(path) < 0) {
+            sys_kprint("rm: cannot remove '");
+            sys_kprint(argv[i]);
+            sys_kprint("'\n");
+            status = 1;
+        }
+    }
+    return status;
+}
+
 static int cmd_help(void)
 {
     sys_kprint("GNU bash-like shell for ex-nihilo-OS\n");
@@ -314,6 +337,8 @@ static int run_command(int argc, char **argv, int *should_exit)
         return cmd_cd(argc, argv);
     if (str_eq(cmd, "cat"))
         return cmd_cat(argc, argv);
+    if (str_eq(cmd, "rm") || str_eq(cmd, "rmdir"))
+        return cmd_rm(argc, argv);
     if (str_eq(cmd, "echo"))
         return cmd_echo(argc, argv);
     if (str_eq(cmd, "clear")) {
