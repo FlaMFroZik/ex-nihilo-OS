@@ -644,10 +644,13 @@ void kmain(void)
                 serial_write("[dbg] before enter_usermode\n");
                 int scode = enter_usermode(user_shell_main,
                                            (char *)sstack + PAGE_SIZE);
-                serial_write("[dbg] after enter_usermode\n");
+                serial_write("[dbg] after enter_usermode, scode=");
+                serial_putc((char)('0' + (scode % 10)));
+                serial_putc('\n');
                 kpmm_free(sstack);
+                serial_write("[dbg] after kpmm_free\n");
                 kexec_cleanup();
-                emit_dec("shell exited with code: ", scode, "");
+                serial_write("[dbg] after kexec_cleanup\n");
             }
         }
     }
