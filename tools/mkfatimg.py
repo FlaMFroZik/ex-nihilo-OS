@@ -136,8 +136,9 @@ def main():
                  "начните ФС позже или уменьшите ядро" % kernel_sectors)
 
     seeded = seeded_files()
-    for i, elf_path in enumerate(user_elfs, 1):
-        seeded["USER%d.ELF" % i] = open(elf_path, "rb").read()
+    for elf_path in user_elfs:
+        name = os.path.basename(elf_path).upper()
+        seeded[name] = open(elf_path, "rb").read()
 
     # 1. FAT16 через mtools — отдельным файлом: mtools пишет ФС от
     #    нулевого смещения, а в образе ей положено жить с сектора 64.
