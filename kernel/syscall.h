@@ -38,7 +38,9 @@
 #define SYS_KFREE   9   /* -> kpmm_free()  */
 #define SYS_KEXECVE 10  /* -> kexecve(): при успехе не возвращается */
 #define SYS_KCLEAR  11  /* -> video_clear(): очистить экран */
-#define SYS_MAX     12
+#define SYS_KGETC   12  /* -> kbd_getc(): прочитать символ */
+#define SYS_KREADDIR 13 /* -> kreaddir(): прочитать запись каталога */
+#define SYS_MAX     14
 
 /* --- Сторона Ring 0 (вызывает kmain) --- */
 
@@ -98,6 +100,12 @@ static inline void sys_kfree(void *addr)
 
 static inline void sys_kclear(void)
 { (void)syscall5(SYS_KCLEAR, 0, 0, 0, 0, 0); }
+
+static inline int32_t sys_kgetc(void)
+{ return syscall5(SYS_KGETC, 0, 0, 0, 0, 0); }
+
+static inline int32_t sys_kreaddir(const char *path, uint32_t index, void *out)
+{ return syscall5(SYS_KREADDIR, (uint32_t)path, index, (uint32_t)out, 0, 0); }
 
 static inline void sys_kexit(int code)
 {

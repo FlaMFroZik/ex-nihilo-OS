@@ -38,7 +38,7 @@ CFLAGS      := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector -fno-b
 LDFLAGS     := -m elf_i386 -nostdlib -T linker.ld --build-id=none
 
 C_SRCS      := kernel.c kernel/kapi.c kernel/syscall.c kernel/user.c kernel/exec.c kernel/paging.c \
-               fs/fat16.c hal/ata.c hal/video.c hal/serial.c
+               fs/fat16.c hal/ata.c hal/video.c hal/serial.c hal/kbd.c
 ASM_SRCS    := kernel.asm kernel/syscall.asm hal/pmm.asm hal/spinlock.asm hal/ata.asm
 FS_C_SRCS   := fs/fat16.c
 
