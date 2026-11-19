@@ -3,6 +3,8 @@
 #include "hal/video.h"
 #include "hal/kbd.h"
 
+extern void syscall_clear_screen(void);
+
 /* Диспетчер syscall'ов. Работает уже в Ring 0 (мы сюда попали через
  * interrupt gate 0x80), поэтому может напрямую вызывать k-функции
  * ядра. Аргументы — сырые uint32_t из регистров пользователя:
@@ -25,7 +27,7 @@ int32_t syscall_dispatch(uint32_t nr, uint32_t a1, uint32_t a2,
                                      (char *const *)a3); /* успех — без возврата */
     case SYS_KALLOC:  return (int32_t)kpmm_alloc();
     case SYS_KFREE:   kpmm_free((void *)a1); return 0;
-    case SYS_KCLEAR:  video_clear(); return 0;
+    case SYS_KCLEAR:  syscall_clear_screen(); return 0;
     case SYS_KGETC:   return kbd_getc();
     case SYS_KREADDIR: return kreaddir((const char *)a1, a2, (fat16_dirent_t *)a3);
     default:          return -22;   /* -EINVAL: нет такого syscall'а */

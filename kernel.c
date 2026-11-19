@@ -325,13 +325,24 @@ static unsigned int print_col;
 static void syscall_print(const char *str)
 {
     for (; *str; str++) {
+        serial_putc(*str);
         if (*str == '\n') {
             print_col = 0;
             newline();
+        } else if (*str == '\b') {
+            if (print_col > 0)
+                print_col--;
         } else {
             print_col = put_char(cursor_row, print_col, *str);
         }
     }
+}
+
+void syscall_clear_screen(void)
+{
+    clear_screen();
+    cursor_row = 0;
+    print_col = 0;
 }
 
 void kmain(void)
