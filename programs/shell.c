@@ -147,7 +147,7 @@ static void cmd_ls(const char *arg)
             sys_kprint("ls: cannot open directory\n");
             return;
         }
-        if (ent.attr & FAT16_ATTR_DIR) {
+        if (ent.attr & FAT16_ATTR_DIRECTORY) {
             sys_kprint("  <DIR>  ");
             sys_kprint(ent.name);
             sys_kprint("\n");
